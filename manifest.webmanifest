@@ -1,0 +1,16 @@
+{
+  "name": "Einkaufsplaner",
+  "short_name": "Einkauf",
+  "description": "Familien-Einkaufs- und Abendessenplaner",
+  "lang": "de",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#F6F3EE",
+  "theme_color": "#2F6B4F",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" },
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}

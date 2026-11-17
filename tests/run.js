@@ -198,6 +198,15 @@ test('10 Zwei Geräte: gleicher Einkauf einmal, zwei verschiedene Einkäufe beid
   assert.throws(() => buy(run, [{ product_id: 'P-GURKE', qty: 9, unit: 'Stk', location_id: 'KS' }], 'einkauf-456'), /anderen Vorgang/);
 });
 
+test('Stückware wird auf ganze Stück aufgerundet', () => {
+  const { s, T } = fixture();
+  T.Recipe.push({ recipe_id: 'R-G', name: 'Gurkensalat', servings_base: 2 });
+  T.RecipeIngredient.push({ recipe_id: 'R-G', line_no: 1, product_id: 'P-GURKE', text_original: 'Gurke', qty: 0.5, unit: 'Stk', per: 'Person' });
+  T.MealPlanEntry.push({ entry_id: 'X', week_start: '2026-11-16', date: '2026-11-18', persons: 3, recipe_id: 'R-G', status: 'bestätigt' });
+  const it = EP.computeShoppingList(s, '2026-11-16', []).find(i => i.product_id === 'P-GURKE');
+  near(it.qty_needed, 1.5); near(it.qty_to_buy, 2); near(it.leftover_after_cooking, 0.5);
+});
+
 test('11 Wochenplanung verändert den Bestand nicht', () => {
   const { s, T, run } = fixture();
   buy(run, [{ product_id: 'P-PATTY', qty: 1, unit: 'Pkg', location_id: 'TK' }]);
@@ -269,6 +278,27 @@ test('Journal-Prüfung: Bestand = Summe aller Buchungen', () => {
   run({ type: 'cook', recipe_id: 'R-MAUL', persons: 3 });
   run({ type: 'set_total', product_id: 'P-MAUL', location_id: 'KS', qty: 10, unit: 'Stk' });
   assert.ok(EP.verifyLedger(s).ok); near(EP.totalStock(s, 'P-MAUL'), 10);
+});
+
+test('Sprachsatz als Stapel: alles oder nichts', () => {
+  const { s, T, run } = fixture();
+  run({ type: 'batch', commands: [
+    { type: 'set_total', product_id: 'P-GURKE', location_id: 'KS', qty: 3, unit: 'Stk' },
+    { type: 'adjust', product_id: 'P-MILCH', location_id: 'KS', qty: 2, unit: 'Pkg' }] });
+  near(EP.totalStock(s, 'P-GURKE'), 3); near(EP.totalStock(s, 'P-MILCH'), 2000);
+  const snap = JSON.stringify(T);
+  assert.throws(() => run({ type: 'batch', commands: [
+    { type: 'adjust', product_id: 'P-GURKE', location_id: 'KS', qty: 1, unit: 'Stk' },
+    { type: 'adjust', product_id: 'P-PIZZA', location_id: 'KS', qty: -5, unit: 'Stk' }] }), /Nicht genug/);
+  assert.strictEqual(JSON.stringify(T), snap, 'erste Aktion wurde nicht gebucht');
+});
+
+test('Einzahl/Mehrzahl wird erkannt, aber nur eindeutig', () => {
+  const { s } = fixture();
+  assert.strictEqual(EP.resolveProduct(s, 'Gurken').product_id, 'P-GURKE');
+  s.tables.Product.push({ product_id: 'P-APFEL', name: 'Apfel', category: 'Obst & Gemüse', base_unit: 'Stk' });
+  assert.strictEqual(EP.resolveProduct(s, 'Äpfel').product_id, 'P-APFEL');
+  assert.strictEqual(EP.resolveProduct(s, 'Pizzen').status === 'resolved', false, 'unregelmäßige Mehrzahl → Rückfrage statt Raten');
 });
 
 console.log(`\n${pass} bestanden, ${failCount} fehlgeschlagen`);

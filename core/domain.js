@@ -84,6 +84,8 @@ var EP = (function () {
       .replace(/(.)\1+/g, '$1');
   }
 
+  function pluralStem(n) { return n.replace(/(en|n|e|s)$/, '').replace(/ae/g, 'a').replace(/oe/g, 'o').replace(/ue/g, 'u'); }
+
   function levenshtein(a, b) {
     var m = a.length, n = b.length, d = [], i, j;
     for (i = 0; i <= m; i++) d[i] = [i];
@@ -116,6 +118,10 @@ var EP = (function () {
     for (var k = 0; k < products.length; k++) {
       if (normalizeName(products[k].name) === norm) return { status: 'resolved', product_id: products[k].product_id, package_id: null, via: 'name' };
     }
+    // Einzahl/Mehrzahl ("Gurken" ↔ "Gurke", "Tomaten" ↔ "Tomate"): nur bei eindeutigem Treffer
+    var stem = pluralStem(norm);
+    var stemHits = products.filter(function (p) { return pluralStem(normalizeName(p.name)) === stem; });
+    if (stem.length >= 3 && stemHits.length === 1) return { status: 'resolved', product_id: stemHits[0].product_id, package_id: null, via: 'plural' };
     // Vorschläge (nie automatisch)
     var rejected = {};
     aliases.forEach(function (a) { if (a.alias_norm === norm && a.status === 'abgelehnt') rejected[a.product_id] = true; });
@@ -391,6 +397,40 @@ var EP = (function () {
 
   // ------------------------------------------------------------- Befehle
   var HANDLERS = {
+    /** Mehrere Befehle als EINE atomare Transaktion (z. B. ein Sprachsatz mit mehreren Aktionen) */
+    batch: function (work, c, tx) {
+      var self = this;
+      var results = (c.commands || []).map(function (cmd) {
+        if (cmd.type === 'batch') fail('NESTED', 'Verschachtelte Stapel nicht erlaubt');
+        var h = HANDLERS[cmd.type];
+        if (!h) fail('UNKNOWN_COMMAND', 'Unbekannter Befehl: ' + cmd.type);
+        return h.call(self, work, cmd, tx);
+      });
+      return { ok: true, results: results };
+    },
+
+    /** Neues Produkt im globalen Katalog */
+    create_product: function (work, c, tx) {
+      var name = String(c.name || '').trim();
+      if (!name) fail('NAME', 'Produktname fehlt');
+      var r = resolveProduct(work, name);
+      if (r.status === 'resolved') fail('EXISTS', '„' + name + '“ gibt es schon', { product_id: r.product_id });
+      if (['g', 'ml', 'Stk'].indexOf(c.base_unit) < 0) fail('UNIT', 'Basiseinheit muss g, ml oder Stk sein');
+      var id = c.product_id || this.idGen('P');
+      work.tables.Product.push({ product_id: id, name: name, category: c.category || 'Sonstiges', base_unit: c.base_unit, default_package_id: '', notes: '', active: true, created_at: tx.ts, updated_at: tx.ts });
+      return { ok: true, product_id: id };
+    },
+
+    /** Neuer Lagerort */
+    create_location: function (work, c, tx) {
+      var name = String(c.name || '').trim();
+      if (!name) fail('NAME', 'Name fehlt');
+      if (work.tables.Location.some(function (l) { return normalizeName(l.name) === normalizeName(name); })) fail('EXISTS', 'Lagerort gibt es schon');
+      var id = c.location_id || this.idGen('LO');
+      work.tables.Location.push({ location_id: id, name: name, sort: work.tables.Location.length + 1, active: true });
+      return { ok: true, location_id: id };
+    },
+
     /** +/- Menge (z. B. "vier gekauft" → +4, "eine entnommen" → -1) */
     adjust: function (work, c, tx) {
       requireLocation(work, c.location_id);
@@ -497,7 +537,7 @@ var EP = (function () {
         var loc = ln.location_id || defaultLocation(work, ln.product_id);
         if (!loc) { skipped.push({ line: idx, reason: 'Lagerort fehlt' }); return; }
         requireLocation(work, loc);
-        receive(self, work, tx, { product_id: ln.product_id, location_id: loc, qty_base: r.qty_base, package_id: r.package_id || ln.package_id, best_before: ln.best_before }, 'purchase', purchaseId, c.receipt_id ? 'Bon ' + c.receipt_id : 'Einkaufsliste');
+        receive(self, work, tx, { product_id: ln.product_id, location_id: loc, qty_base: r.qty_base, package_id: r.package_id || ln.package_id, best_before: ln.best_before }, 'purchase', purchaseId, c.receipt_id ? 'Bon ' + c.receipt_id : c.source === 'liste' ? 'Einkaufsliste' : (c.source || 'Einkauf'));
         if (ln.shopping_item_id) {
           work.tables.ShoppingItem.forEach(function (s) { if (s.item_id === ln.shopping_item_id) { s.purchase_id = purchaseId; s.checked = true; } });
         }
@@ -618,9 +658,9 @@ var EP = (function () {
    * Bestand wird je Produkt EINMAL gegengerechnet. Packungen werden aufgerundet, wenn bestätigt.
    * Manuelle Positionen/Overrides aus existingItems bleiben erhalten.
    */
-  function computeShoppingList(store, weekStart, existingItems) {
+  function computeShoppingList(store, weekStart, existingItems, fromDate) {
     var need = {}, unclear = [], origins = {};
-    var entries = store.tables.MealPlanEntry.filter(function (e) { return e.week_start === weekStart && e.status === 'bestätigt' && e.recipe_id; });
+    var entries = store.tables.MealPlanEntry.filter(function (e) { return e.week_start === weekStart && e.status === 'bestätigt' && e.recipe_id && (!fromDate || e.date >= fromDate); });
     entries.forEach(function (e) {
       var pv = previewCook(store, e.recipe_id, e.persons);
       pv.lines.forEach(function (l) {
@@ -641,6 +681,7 @@ var EP = (function () {
       var pkg = getPackage(store, product.default_package_id);
       var content = packageContentBase(store, product, pkg);
       if (missing > EPS && content) { it.packages = Math.ceil(missing / content - EPS); it.qty_to_buy = round(it.packages * content); it.package_label = pkg.label; it.leftover_after_cooking = round(it.qty_to_buy - missing); }
+      else if (missing > EPS && product.base_unit === 'Stk' && Math.abs(missing - Math.round(missing)) > EPS) { it.qty_to_buy = Math.ceil(missing - EPS); it.leftover_after_cooking = round(it.qty_to_buy - missing); }
       if (missing > EPS) items.push(it);
     });
     // Mindestbestände
