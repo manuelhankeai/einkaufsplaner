@@ -45,7 +45,15 @@ var Illus = (function () {
     if (/omelett|ei\b|eier|rührei|pfannkuchen/.test(n)) return 'egg';
     return 'plate';
   }
-  function dish(r, cls) { return svg('0 0 64 64', DISH[dishKind(r)], cls || 'dish'); }
+  // Echtes Bild (img/bilder.js), sonst Vektor. Lädt das Bild nicht, springt der Vektor ein.
+  function pic(key, cls, fallbackSvg) {
+    var b = (typeof BILDER !== 'undefined') && BILDER[key];
+    if (!b) return fallbackSvg;
+    return '<span class="pic ' + cls + '"><img src="' + b.src + '" width="' + b.w + '" height="' + b.h + '" alt="" decoding="async" loading="lazy" ' +
+      'onerror="this.parentNode.classList.add(\'fail\')">' + fallbackSvg + '</span>';
+  }
+  function dishSvg(r, cls) { return svg('0 0 64 64', DISH[dishKind(r)], cls || 'dish'); }
+  function dish(r, cls) { return pic('dish-' + dishKind(r), cls || 'dish', dishSvg(r, 'fb')); }
 
   // --------------------------------------------------------------- Szenen (Kopf)
   var SCENE = {
@@ -84,7 +92,8 @@ var Illus = (function () {
       '<rect x="' + (x + 2) + '" y="' + (y + h - 2 - fh) + '" width="' + (w - 4) + '" height="' + fh + '" rx="2.5" class="' + fillCls + '"/>' +
       '<rect x="' + (x + 3) + '" y="' + (y + 7) + '" width="2" height="' + (h - 14) + '" rx="1" class="f-shine" opacity=".7"/>';
   }
-  function scene(name) { return SCENE[name] ? svg('0 0 180 100', SCENE[name], 'scene') : ''; }
+  function sceneSvg(name, cls) { return SCENE[name] ? svg('0 0 180 100', SCENE[name], cls || 'scene') : ''; }
+  function scene(name) { return SCENE[name] ? pic('scene-' + name, 'scene', sceneSvg(name, 'fb')) : ''; }
 
   // ---------------------------------------------------------------- Abteilungen
   var DEPT = {
@@ -113,5 +122,5 @@ var Illus = (function () {
   };
   function tab(name) { return '<svg class="ico" viewBox="0 0 24 24" aria-hidden="true">' + TAB[name] + '</svg>'; }
 
-  return { dish: dish, dishKind: dishKind, scene: scene, dept: dept, tab: tab };
+  return { dish: dish, dishSvg: dishSvg, dishKind: dishKind, scene: scene, sceneSvg: sceneSvg, dept: dept, tab: tab };
 })();

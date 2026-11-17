@@ -2,6 +2,10 @@
  * Palette aus der Küche: Porzellan (Grund), Aubergine (Tinte & Aktion), Salbei (frisch/ok),
  * Kürbis (bald aufbrauchen), Paprika (abgelaufen/fehlt), Zitrone (Hervorhebung), Holz (Regal).
  * Schrift: Bricolage Grotesque für Überschriften (Marktschild-Charakter), Systemschrift für Text. */
+
+/* Selbst gehostete Schrift (SIL Open Font License, siehe fonts/OFL.txt) – keine Anfragen an Google Fonts. */
+@font-face { font-family: "Bricolage Grotesque"; src: url("fonts/BricolageGrotesque-Regular.woff") format("woff"); font-weight: 300 599; font-display: swap; }
+@font-face { font-family: "Bricolage Grotesque"; src: url("fonts/BricolageGrotesque-Bold.woff") format("woff"); font-weight: 600 900; font-display: swap; }
 :root {
   --porzellan: #F2F4EF;
   --surface: #FFFFFF;
@@ -72,7 +76,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .masthead { position: relative; padding: calc(var(--safe-t) + 18px) 20px 6px; max-width: 760px; margin: 0 auto; display: grid; grid-template-columns: 1fr auto; align-items: end; min-height: 132px; }
 .masthead .brand { font-family: var(--display); font-weight: 700; font-size: 15px; letter-spacing: -.01em; color: var(--aub); display: flex; align-items: center; gap: 6px; }
 .masthead .brand svg { width: 18px; height: 18px; }
-.masthead h1 { font-family: var(--display); font-weight: 750; font-size: 40px; line-height: .98; letter-spacing: -.035em; margin: 6px 0 4px; font-variation-settings: "opsz" 96, "wdth" 92; }
+.masthead h1 { font-family: var(--display); font-weight: 750; font-size: 40px; line-height: .98; letter-spacing: -.035em; margin: 6px 0 4px; }
 .masthead .date { color: var(--muted); font-size: 14px; }
 .masthead .scene { width: 150px; height: 84px; margin-right: -6px; }
 .masthead .gear { position: absolute; top: calc(var(--safe-t) + 12px); right: 16px; }
@@ -205,6 +209,7 @@ textarea { min-height: 96px; resize: vertical; }
 .seg button.on { background: var(--surface); color: var(--aub); box-shadow: var(--shadow); }
 .seg.need { outline: 2px solid var(--kuerbis); outline-offset: 1px; background: var(--kuerbis-soft); }
 .empty { text-align: center; padding: 28px 22px 30px; color: var(--muted); }
+.empty .scene { display: block; margin: 0 auto 8px; }
 .empty svg.scene { width: 180px; height: 100px; margin-bottom: 8px; }
 .note { background: var(--kuerbis-soft); border-radius: 14px; padding: 12px 14px; font-size: 14.5px; margin-bottom: 12px; }
 .note.info { background: var(--aub-soft); }
@@ -297,3 +302,21 @@ textarea { min-height: 96px; resize: vertical; }
   .tabbar button.on::before { top: 9px; }
   .fab { bottom: 28px; right: 28px; }
 }
+
+/* Echte Bilder (Canva) mit Vektor-Rückfall */
+.pic { display: inline-block; position: relative; flex: none; overflow: hidden; }
+.pic img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.pic > svg.fb { display: none; width: 100%; height: 100%; }
+.pic.fail img { display: none; }
+.pic.fail > svg.fb { display: block; }
+.pic.dish { border-radius: 50%; background: var(--surface-2); }
+.pic.dish img { transform: scale(1.06); }
+.pic.scene { border-radius: 18px; box-shadow: 0 6px 16px rgba(42, 27, 48, .12); }
+.empty .pic.scene { width: 180px; height: 100px; }
+.tonight .pic.dish.lg { box-shadow: 0 0 0 4px rgba(255, 255, 255, .16); filter: drop-shadow(0 10px 14px rgba(0, 0, 0, .3)); }
+@media (prefers-color-scheme: dark) {
+  .pic img { filter: brightness(.86) saturate(.92); }
+  .pic.scene { box-shadow: 0 0 0 1px rgba(255, 255, 255, .08); }
+}
+.masthead { min-height: 146px; }
+.masthead .pic.scene { width: 140px; height: 79px; margin-bottom: 4px; }
