@@ -301,5 +301,20 @@ test('Einzahl/Mehrzahl wird erkannt, aber nur eindeutig', () => {
   assert.strictEqual(EP.resolveProduct(s, 'Pizzen').status === 'resolved', false, 'unregelmäßige Mehrzahl → Rückfrage statt Raten');
 });
 
+test('Planungsbefehle dürfen Journal/Bestand nicht anfassen; gebuchte Liste bleibt gebucht', () => {
+  const { s, run } = fixture();
+  assert.throws(() => run({ type: 'upsert_rows', table: 'StockLot', rows: [{ lot_id: 'X', qty_base: 99 }] }), /nicht änderbar/);
+  assert.throws(() => run({ type: 'upsert_rows', table: 'StockEvent', rows: [{ event_id: 'X' }] }), /nicht änderbar/);
+  assert.throws(() => run({ type: 'delete_rows', table: 'StockEvent', match: [{ type: 'cook' }] }), /nicht änderbar/);
+  assert.throws(() => run({ type: 'delete_rows', table: 'ShoppingItem', match: [] }), /Löschbedingung/);
+  run({ type: 'upsert_rows', table: 'ShoppingItem', rows: [{ item_id: 'SI-1', product_id: 'P-MILCH', text: 'Milch', checked: true }] });
+  buy(run, [{ product_id: 'P-MILCH', qty: 1, unit: 'Pkg', location_id: 'KS', shopping_item_id: 'SI-1' }]);
+  const pid = s.tables.ShoppingItem[0].purchase_id;
+  assert.ok(pid);
+  run({ type: 'upsert_rows', table: 'ShoppingItem', rows: [{ item_id: 'SI-1', checked: false, purchase_id: '' }] });
+  assert.strictEqual(s.tables.ShoppingItem[0].purchase_id, pid, 'Einkaufs-ID lässt sich nicht wegschreiben');
+  assert.strictEqual(EP.verifyLedger(s).ok, true);
+});
+
 console.log(`\n${pass} bestanden, ${failCount} fehlgeschlagen`);
 process.exit(failCount ? 1 : 0);

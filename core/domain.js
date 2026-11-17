@@ -40,6 +40,11 @@ var EP = (function () {
   };
 
   var EPS = 1e-9;
+  /** Tabellen, die über upsert_rows/delete_rows geändert werden dürfen, mit Schlüsselspalten. Journal & Bestand nie. */
+  var EDITABLE = {
+    Recipe: ['recipe_id'], RecipeIngredient: ['recipe_id', 'line_no'], MealPlan: ['week_start'], MealPlanEntry: ['entry_id'],
+    ShoppingItem: ['item_id'], Settings: ['key'], MinStock: ['product_id', 'location_id']
+  };
 
   function DomainError(code, message, details) {
     this.name = 'DomainError';
@@ -284,6 +289,7 @@ var EP = (function () {
     Object.keys(store.tables).forEach(function (k) { if (beforeSnap[k] !== JSON.stringify(store.tables[k])) changed.push(k); });
     return changed;
   }
+  function copyWith(o, patch) { var r = {}; Object.keys(o).forEach(function (k) { r[k] = o[k]; }); Object.keys(patch).forEach(function (k) { r[k] = patch[k]; }); return r; }
   function deepCopy(o) { return JSON.parse(JSON.stringify(o)); }
   function stableHash(obj) {
     var s = stableStringify(obj), h1 = 0x811c9dc5, h2 = 0;
@@ -323,8 +329,30 @@ var EP = (function () {
 
   /** Zugang: legt neue Charge an oder ergänzt identische ungeöffnete Charge (gleiches MHD, Ort, Packung). */
   function receive(self, work, tx, p, type, sourceRef, note) {
+    // Ohne Packungsangabe, aber mit bestätigter Standardpackung: in ganze Packungen + angebrochenen Rest aufteilen.
+    // Beispiel: 8 Patties (4er-Packung) = 2 Packungen; 6 Patties = 1 Packung + 2 Stück angebrochen.
+    if (!p.package_id && !p.opened_at) {
+      var prod = getProduct(work, p.product_id);
+      var dpkg = prod && getPackage(work, prod.default_package_id);
+      var cont = dpkg ? packageContentBase(work, prod, dpkg) : null;
+      if (cont && cont > EPS) {
+        var full = Math.floor((p.qty_base + EPS) / cont), rest = round(p.qty_base - full * cont), ev;
+        if (full > 0) ev = receive(self, work, tx, copyWith(p, { package_id: dpkg.package_id, qty_base: round(full * cont) }), type, sourceRef, note);
+        if (rest > EPS) ev = receive(self, work, tx, copyWith(p, { package_id: dpkg.package_id, qty_base: rest, opened_at: isoDate(tx.ts) }), type, sourceRef,
+          (note ? note + ' · ' : '') + 'Teilpackung, als angebrochen erfasst');
+        return ev;
+      }
+    }
     var bb = isoDate(p.best_before);
     var lot = null;
+    if (p.opened_at && p.package_id) {
+      // Rest zu einer bereits angebrochenen Packung desselben Orts legen, solange sie dadurch nicht voller als eine Packung wird
+      var pr = getProduct(work, p.product_id), pc = packageContentBase(work, pr, getPackage(work, p.package_id));
+      lot = work.tables.StockLot.filter(function (l) {
+        return l.product_id === p.product_id && l.location_id === p.location_id && l.opened_at && l.package_id === p.package_id &&
+          num(l.qty_base) > EPS && (!pc || num(l.qty_base) + p.qty_base <= pc + EPS);
+      })[0] || null;
+    }
     if (!p.opened_at) {
       lot = work.tables.StockLot.filter(function (l) {
         return l.product_id === p.product_id && l.location_id === p.location_id && !l.opened_at &&
@@ -373,8 +401,9 @@ var EP = (function () {
         }
       } else {
         lot.qty_base = round(have - take);
-        if (!lot.opened_at && num(lot.qty_base) > EPS && !content) {
-          // Teilentnahme aus Charge ohne bekannte Packungsgröße: als angebrochen markieren
+        if (!lot.opened_at && num(lot.qty_base) > EPS && !content && product.base_unit !== 'Stk') {
+          // Teilentnahme aus Charge ohne bekannte Packungsgröße (g/ml, z. B. Käse am Stück): als angebrochen markieren.
+          // Lose Stückware (Äpfel, Zwiebeln) wird nie „angebrochen“.
           lot.opened_at = isoDate(tx.ts);
         }
         addEvent(self, work, tx, type, lot, -take, sourceRef, note);
@@ -561,7 +590,15 @@ var EP = (function () {
         lines.push({ text: l.text, product_id: l.product_id, status: r.missing > EPS ? 'teilweise' : 'ok', booked: r.taken, missing: r.missing, unit: l.unit });
       });
       work.tables.CookEvent.push({ cook_id: cookId, recipe_id: c.recipe_id, date: isoDate(c.date || tx.ts), persons: pv.persons, tx_id: tx.tx_id, user: tx.user, ts: tx.ts });
-      if (c.meal_plan_entry_id) work.tables.MealPlanEntry.forEach(function (e) { if (e.entry_id === c.meal_plan_entry_id) { e.status = 'gekocht'; e.updated_at = tx.ts; } });
+      if (c.meal_plan_entry_id) {
+        var found = false;
+        work.tables.MealPlanEntry.forEach(function (e) { if (e.entry_id === c.meal_plan_entry_id) { e.status = 'gekocht'; e.updated_at = tx.ts; found = true; } });
+        if (!found && c.meal_plan_entry) {
+          var me = {}; SCHEMA.MealPlanEntry.forEach(function (col) { me[col] = c.meal_plan_entry[col] == null ? '' : c.meal_plan_entry[col]; });
+          me.entry_id = c.meal_plan_entry_id; me.status = 'gekocht'; me.updated_at = tx.ts;
+          work.tables.MealPlanEntry.push(me);
+        }
+      }
       return { ok: true, cook_id: cookId, lines: lines };
     },
 
@@ -589,6 +626,43 @@ var EP = (function () {
       if (toBaseSimple(work, product, num(c.content_qty), normUnit(pkg.content_unit)) === null) fail('UNIT', 'Packungsinhalt nicht in ' + product.base_unit + ' umrechenbar');
       if (c.make_default || !product.default_package_id) product.default_package_id = pkg.package_id;
       return { ok: true, package_id: pkg.package_id };
+    },
+
+    /**
+     * Planungs-, Rezept- und Listendaten (keine Bestandsbuchung!). Nur freigegebene Tabellen,
+     * nur bekannte Spalten. Zeilen werden über ihren Schlüssel ersetzt oder neu angelegt.
+     * Schutz: purchase_id einer Einkaufslisten-Position kann hier weder gesetzt noch gelöscht werden.
+     */
+    upsert_rows: function (work, c, tx) {
+      var keys = EDITABLE[c.table];
+      if (!keys) fail('TABLE', 'Tabelle ' + c.table + ' ist hierüber nicht änderbar');
+      var cols = SCHEMA[c.table], n = 0;
+      (c.rows || []).forEach(function (row) {
+        keys.forEach(function (k) { if (row[k] === undefined || row[k] === null || row[k] === '') fail('KEY', 'Schlüssel ' + k + ' fehlt (' + c.table + ')'); });
+        var clean = {};
+        cols.forEach(function (col) { if (row[col] !== undefined) clean[col] = row[col] === null ? '' : row[col]; });
+        if (cols.indexOf('updated_at') >= 0) clean.updated_at = tx.ts;
+        var ex = work.tables[c.table].filter(function (r) { return keys.every(function (k) { return String(r[k]) === String(row[k]); }); })[0];
+        if (c.table === 'ShoppingItem') { delete clean.purchase_id; }
+        if (ex) { Object.keys(clean).forEach(function (col) { ex[col] = clean[col]; }); }
+        else {
+          var fresh = {}; cols.forEach(function (col) { fresh[col] = clean[col] !== undefined ? clean[col] : ''; });
+          work.tables[c.table].push(fresh);
+        }
+        n++;
+      });
+      return { ok: true, table: c.table, upserted: n };
+    },
+    /** Löscht Zeilen (gleiche Freigabeliste). match: Liste von Feld=Wert-Objekten, z. B. [{ recipe_id: 'R-1' }]. */
+    delete_rows: function (work, c, tx) {
+      if (!EDITABLE[c.table]) fail('TABLE', 'Tabelle ' + c.table + ' ist hierüber nicht änderbar');
+      var matches = c.match || [];
+      if (!matches.length || matches.some(function (m) { return !m || !Object.keys(m).length; })) fail('MATCH', 'Löschbedingung fehlt');
+      var before = work.tables[c.table].length;
+      work.tables[c.table] = work.tables[c.table].filter(function (r) {
+        return !matches.some(function (m) { return Object.keys(m).every(function (k) { return String(r[k]) === String(m[k]); }); });
+      });
+      return { ok: true, table: c.table, deleted: before - work.tables[c.table].length };
     },
 
     /** Bon registrieren mit Dublettenprüfung (Datei-Hash + Inhalts-Fingerabdruck) */
@@ -812,7 +886,7 @@ var EP = (function () {
 
   return {
     isAllowed: isAllowed, requestAccess: requestAccess, decideAccess: decideAccess, verifyLedger: verifyLedger,
-    SCHEMA: SCHEMA, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen,
+    SCHEMA: SCHEMA, EDITABLE: EDITABLE, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen,
     normalizeName: normalizeName, resolveProduct: resolveProduct, normUnit: normUnit, toBase: toBase,
     totalStock: totalStock, lotsOf: lotsOf, fefoSort: fefoSort,
     Engine: Engine, previewCook: previewCook, computeShoppingList: computeShoppingList,
