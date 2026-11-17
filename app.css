@@ -320,3 +320,17 @@ textarea { min-height: 96px; resize: vertical; }
 }
 .masthead { min-height: 146px; }
 .masthead .pic.scene { width: 140px; height: 79px; margin-bottom: 4px; }
+
+/* Anmeldung & Status */
+body.locked .tabbar, body.locked .fab { display: none; }
+.auth { max-width: 420px; margin: 24px auto; text-align: center; padding: 8px 8px 40px; }
+.auth .scene, .auth svg.scene { width: 240px; height: 136px; margin: 0 auto 18px; display: block; }
+.auth h2 { font-family: var(--display); font-size: 30px; letter-spacing: -.03em; margin: 8px 0 10px; }
+.auth p { color: var(--muted); line-height: 1.45; margin: 0 0 18px; }
+.gbtn { min-height: 46px; display: flex; justify-content: center; }
+.busy { display: none; margin-left: 6px; font-size: 12px; font-weight: 650; color: var(--muted); font-family: var(--text); }
+.busy.on { display: inline-block; animation: pulse 1.2s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+.mini.primary { background: var(--aub); color: #fff; }
+.btn.primary[data-action="user-decide"] { flex: 1; }
+.btn[data-action="user-decide"] { flex: 1; }

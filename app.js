@@ -1,6 +1,8 @@
-/* Einkaufsplaner – Web-App (Demo-Modus).
- * Alle Bestandsänderungen laufen über EP.Engine (core/domain.js): dieselbe Logik wie im späteren Backend.
- * Demo-Daten liegen nur im Speicher dieses Browsers. */
+/* Tischlein – Web-App.
+ * Alle Änderungen sind Befehle an die Fachlogik (core/domain.js):
+ *  - Demo-Modus: Fachlogik läuft im Browser, Daten nur auf diesem Gerät.
+ *  - Online: Befehl geht an das Backend (Apps Script), das ihn unter Sperre gegen die Google-Tabelle bucht.
+ *    Erfolg wird erst nach Bestätigung des Servers angezeigt. */
 (function () {
   'use strict';
 
@@ -11,6 +13,8 @@
 
   var store, engine;
   var state = { tab: 'today', loc: 'all', search: '', weekOffset: 0 };
+  var auth = { phase: 'demo' }, rev = 0, busy = 0, ai = { configured: false }, users = null;
+  var media = null; // laufende Aufnahme (MediaRecorder)
   var sheet = null;
   var recognition = null;
 
@@ -64,7 +68,16 @@
   }
 
   // ------------------------------------------------------- Speicher & Buchung
+  function ensureTables() { Object.keys(EP.SCHEMA).forEach(function (k) { if (!store.tables[k]) store.tables[k] = []; }); }
   function load() {
+    if (Net.live()) {
+      var c = Net.cachedStore();
+      store = c && c.tables ? { tables: c.tables } : EP.newStore();
+      rev = c ? c.rev || 0 : 0;
+      ensureTables(); engine = null;
+      auth = { phase: Net.session() ? 'checking' : 'login', hasCache: !!c };
+      return;
+    }
     try { var raw = localStorage.getItem(STORE_KEY); if (raw) store = JSON.parse(raw); } catch (e) { store = null; }
     if (!store || !store.tables || !store.tables.Product) store = Seed.build();
     Object.keys(EP.SCHEMA).forEach(function (k) { if (!store.tables[k]) store.tables[k] = []; });
@@ -72,19 +85,106 @@
     save(true);
   }
   function save(silent) {
+    if (Net.live()) return true; // online: der Server speichert, nicht der Browser
     try { localStorage.setItem(STORE_KEY, JSON.stringify(store)); return true; }
     catch (e) { if (!silent) toast('Im Browser konnte nicht gespeichert werden', true); return false; }
   }
-  /** Führt einen Befehl über die Fachlogik aus. Erfolg wird nur gemeldet, wenn auch gespeichert. */
+  /**
+   * Führt einen Befehl über die Fachlogik aus. Liefert ein Promise mit dem Ergebnis oder null (Fehler wurde angezeigt).
+   * Erfolg erst, wenn gespeichert: im Demo-Modus im Browser, online nach Bestätigung des Servers.
+   * Derselbe Schlüssel bei Wiederholung (Doppelklick, Netz) bucht nie doppelt.
+   */
   function run(cmd, key) {
-    try {
-      var r = engine.execute(cmd, { idempotencyKey: key || uuid(), user: 'Demo' });
-      if (!save()) throw new Error('Nicht gespeichert');
-      return r;
-    } catch (e) {
-      toast(e.message || String(e), true);
-      return null;
+    key = key || uuid();
+    if (!Net.live()) {
+      try {
+        var r = engine.execute(cmd, { idempotencyKey: key, user: 'Demo' });
+        if (!save()) throw new Error('Nicht gespeichert');
+        render();
+        return Promise.resolve(r);
+      } catch (e) { toast(e.message || String(e), true); return Promise.resolve(null); }
     }
+    setBusy(1);
+    return Net.call('exec', { command: cmd, key: key }).then(function (res) {
+      setBusy(-1);
+      if (!res.ok) { netError(res); return null; }
+      Object.keys(res.tables || {}).forEach(function (k) { store.tables[k] = res.tables[k]; });
+      rev = res.rev; Net.cacheStore(store, rev);
+      render();
+      return res.result;
+    });
+  }
+  function upsert(table, rows) { return run({ type: 'upsert_rows', table: table, rows: rows.map(clean) }); }
+  function clean(row) { var o = {}; Object.keys(row).forEach(function (k) { if (k.charAt(0) !== '_') o[k] = row[k]; }); return o; }
+  function setBusy(d) { busy = Math.max(0, busy + d); var b = $('busy'); if (b) b.className = 'busy' + (busy ? ' on' : ''); }
+  function netError(res) {
+    if (res.code === 'AUTH') { auth.phase = 'login'; toast(res.message || 'Bitte erneut anmelden', true); render(); return; }
+    if (res.code === 'NO_ACCESS') { lockOut(); Net.call('hello').then(afterHello); return; }
+    toast(res.message || 'Fehler – nichts gespeichert', true);
+  }
+
+  // ------------------------------------------------------------- Online: Anmeldung & Abgleich
+  function boot() {
+    if (!Net.live()) return;
+    var tok = Net.takeRedirectToken();
+    if (tok) { auth.phase = 'checking'; render(); Net.login(tok).then(afterHello); return; }
+    if (auth.phase === 'checking') Net.call('hello').then(afterHello);
+  }
+  function onGoogleToken(idToken) { auth.phase = 'checking'; render(); Net.login(idToken).then(afterHello); }
+  function afterHello(r) {
+    if (!r.ok) {
+      if (r.code === 'AUTH') { auth.phase = 'login'; auth.error = r.message; }
+      else if (auth.hasCache) { auth.phase = 'ready'; auth.offline = true; toast(r.message || 'Offline – nur Ansicht', true); }
+      else { auth.phase = 'error'; auth.error = r.message; }
+      render(); return;
+    }
+    auth.email = r.email; auth.name = r.name; auth.owner = r.owner; auth.status = r.status; auth.error = ''; auth.offline = false;
+    if (!r.allowed) { lockOut(); render(); return; }
+    if (r.rev !== rev || !auth.hasCache) refresh(); else { auth.phase = 'ready'; render(); }
+    Net.call('ai_status').then(function (a) { if (a.ok) ai = a; });
+  }
+  /** Kein Zugriff (mehr): Fenster schließen, Daten von diesem Gerät entfernen. */
+  function lockOut() {
+    auth.phase = 'pending';
+    Net.clearCache(); store = EP.newStore(); rev = 0; auth.hasCache = false; users = null;
+    if (sheet) { sheet = null; $('sheet').classList.remove('open'); $('backdrop').classList.remove('open'); }
+    render();
+  }
+  function refresh() {
+    setBusy(1);
+    return Net.call('bootstrap').then(function (r) {
+      setBusy(-1);
+      if (!r.ok) { netError(r); if (auth.phase === 'checking') { auth.phase = auth.hasCache ? 'ready' : 'error'; auth.error = r.message; render(); } return; }
+      store = { tables: r.tables }; ensureTables(); rev = r.rev; Net.cacheStore(store, rev);
+      auth.phase = 'ready'; auth.hasCache = true; auth.owner = r.owner;
+      render();
+    });
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState !== 'visible' || !Net.live() || auth.phase !== 'ready' || busy) return;
+    Net.call('hello').then(function (r) { if (r.ok && r.allowed && r.rev !== rev) refresh(); else if (r.ok && !r.allowed) { auth.status = r.status; lockOut(); } });
+  });
+  function viewAuth() {
+    var h = '<div class="auth">' + Illus.scene('today');
+    if (auth.phase === 'login') {
+      h += '<h2>Willkommen bei Tischlein</h2><p>Melde dich mit deinem Google-Konto an. Beim ersten Mal fragt die App den Besitzer nach einer Freigabe.</p>' +
+        '<div id="gbtn" class="gbtn"><button class="btn primary block" data-action="login-redirect">Mit Google anmelden</button></div>' +
+        '<button class="link" data-action="login-redirect" style="margin-top:14px">Anmeldefenster öffnet nicht? Über die Google-Seite anmelden</button>' +
+        (auth.error ? '<p class="small" style="color:var(--bad)">' + esc(auth.error) + '</p>' : '');
+    } else if (auth.phase === 'checking') {
+      h += '<h2>Einen Moment …</h2><p>Verbinde mit deiner Datenbasis.</p>';
+    } else if (auth.phase === 'pending') {
+      var st = auth.status;
+      h += '<h2>' + (st === 'angefragt' ? 'Anfrage ist unterwegs' : st === 'abgelehnt' ? 'Kein Zugang' : 'Fast geschafft') + '</h2>' +
+        '<p>Angemeldet als <b>' + esc(auth.email || '') + '</b>.</p>' +
+        (st === 'angefragt' ? '<p>Der Besitzer hat eine E-Mail bekommen. Sobald er dich freigibt, geht es hier los.</p><button class="btn primary block" data-action="auth-check">Erneut prüfen</button>' :
+          st === 'abgelehnt' ? '<p>Der Besitzer hat den Zugang nicht freigegeben.</p>' :
+          '<p>Damit du die Daten der Familie sehen und ändern kannst, muss der Besitzer dich einmal freigeben.</p><button class="btn primary block" data-action="access-request">Zugang anfragen</button>') +
+        '<button class="link" data-action="logout" style="margin-top:16px">Mit anderem Konto anmelden</button>';
+    } else {
+      h += '<h2>Keine Verbindung</h2><p>' + esc(auth.error || 'Der Server ist gerade nicht erreichbar.') + '</p><button class="btn primary block" data-action="auth-check">Erneut versuchen</button>';
+    }
+    return h + '</div>';
   }
 
   var toastTimer;
@@ -110,9 +210,18 @@
     $('fab').innerHTML = Illus.tab('mic');
   }
   function render() {
+    var locked = Net.live() && auth.phase !== 'ready';
+    document.body.classList.toggle('locked', locked);
+    if (locked) {
+      if (sheet && auth.phase !== 'ready') { sheet = null; $('sheet').classList.remove('open'); $('backdrop').classList.remove('open'); }
+      $('masthead').innerHTML = '<div><div class="brand">' + Illus.tab('pantry') + 'Tischlein</div></div>';
+      $('view').innerHTML = viewAuth();
+      if (auth.phase === 'login') { var gb = $('gbtn'); if (gb) Net.renderGoogleButton(gb, onGoogleToken).catch(function () { /* Ersatzknopf bleibt sichtbar */ }); }
+      return;
+    }
     var now = new Date();
     var dateTxt = WD_LONG[now.getDay()] + ', ' + now.getDate() + '. ' + now.toLocaleString('de-DE', { month: 'long' });
-    $('masthead').innerHTML = '<div><div class="brand">' + Illus.tab('pantry') + 'Tischlein<span class="demo-flag">Demo</span></div>' +
+    $('masthead').innerHTML = '<div><div class="brand">' + Illus.tab('pantry') + 'Tischlein' + envFlag() + '<span id="busy" class="busy' + (busy ? ' on' : '') + '">Speichert …</span></div>' +
       '<h1>' + TITLES[state.tab] + '</h1><div class="date">' + (state.tab === 'today' ? dateTxt : esc(SUBTITLE[state.tab]())) + '</div></div>' +
       (SCENE_OF[state.tab] ? Illus.scene(SCENE_OF[state.tab]) : '<div></div>') +
       (state.tab === 'settings' ? '' : '<button class="gear" data-action="tab" data-tab="settings" aria-label="Einstellungen">' + Illus.tab('settings') + '</button>');
@@ -122,12 +231,18 @@
     document.title = TITLES[state.tab] + ' – Tischlein';
   }
 
+  function envFlag() {
+    if (!Net.live()) return '<span class="demo-flag">Demo</span>';
+    if (auth.offline) return '<span class="demo-flag">Offline</span>';
+    return Net.conf().env === 'TEST' ? '<span class="demo-flag">Test</span>' : '';
+  }
   function weekStart(offset) { return addDays(Seed.monday(new Date()), 7 * (offset || 0)); }
   function ensureWeek(ws) {
     for (var i = 0; i < 7; i++) {
       var d = addDays(ws, i);
       if (!T().MealPlanEntry.some(function (e) { return e.date === d; })) {
-        T().MealPlanEntry.push({ entry_id: 'MP-' + uuid().slice(0, 8), week_start: ws, date: d, persons: defaultPersons(), recipe_id: '', status: '', note: '', updated_at: new Date().toISOString() });
+        // nur angezeigt; gespeichert wird die Zeile erst, wenn jemand sie ändert (feste ID je Datum → keine Dubletten zwischen Geräten)
+        T().MealPlanEntry.push({ entry_id: 'MP-' + d, week_start: ws, date: d, persons: defaultPersons(), recipe_id: '', status: '', note: '', updated_at: '', _virtual: true });
       }
     }
   }
@@ -180,7 +295,7 @@
   // ---- Woche
   function viewWeek() {
     var ws = weekStart(state.weekOffset);
-    ensureWeek(ws); save(true);
+    ensureWeek(ws);
     var entries = T().MealPlanEntry.filter(function (e) { return e.date >= ws && e.date <= addDays(ws, 6); }).sort(function (a, b) { return a.date < b.date ? -1 : 1; });
     var recipes = T().Recipe.filter(function (r) { return !r.disliked; }).sort(function (a, b) { return a.name.localeCompare(b.name); });
     var t = today();
@@ -211,7 +326,7 @@
     var ws = weekStart(state.weekOffset), t = today();
     var entries = T().MealPlanEntry.filter(function (e) { return e.date >= ws && e.date <= addDays(ws, 6); });
     var used = {}; entries.forEach(function (e) { if (e.recipe_id) used[e.recipe_id] = (used[e.recipe_id] || 0) + 1; });
-    var filled = 0;
+    var filled = 0, rows = [];
     entries.sort(function (a, b) { return a.date < b.date ? -1 : 1; }).forEach(function (e) {
       if (e.recipe_id || e.date < t) return;
       var best = null, bestScore = -1e9;
@@ -231,9 +346,10 @@
         score -= 6 * (used[r.recipe_id] || 0);
         if (score > bestScore) { bestScore = score; best = { r: r, why: why }; }
       });
-      if (best) { e.recipe_id = best.r.recipe_id; e.status = 'Vorschlag'; e.note = best.why.length ? 'nutzt ' + best.why.join(', ') : ''; used[best.r.recipe_id] = (used[best.r.recipe_id] || 0) + 1; filled++; }
+      if (best) { rows.push(Object.assign({}, e, { recipe_id: best.r.recipe_id, status: 'Vorschlag', note: best.why.length ? 'nutzt ' + best.why.join(', ') : '' })); used[best.r.recipe_id] = (used[best.r.recipe_id] || 0) + 1; filled++; }
     });
-    save(); toast(filled ? filled + ' Vorschlag/Vorschläge eingetragen' : 'Keine freien Tage');
+    if (!rows.length) { toast('Keine freien Tage'); return; }
+    upsert('MealPlanEntry', rows).then(function (r) { if (r) toast(filled + (filled > 1 ? ' Vorschläge' : ' Vorschlag') + ' eingetragen'); });
   }
 
   // ---- Kochbuch
@@ -253,6 +369,9 @@
   }
 
   // ---- Einkauf
+  var lastItems = {};
+  /** Position (gespeichert oder nur berechnet) als vollständige Zeile */
+  function itemRow(id) { return lastItems[id] || T().ShoppingItem.filter(function (x) { return x.item_id === id; })[0]; }
   function shoppingItems() {
     var ws = weekStart(0);
     var existing = T().ShoppingItem.filter(function (i) { return i.week_start === ws; });
@@ -261,8 +380,7 @@
       if (!i.item_id) i.item_id = 'SI-' + (i.product_id || EP.normalizeName(i.text)) + '-' + (i.origin || '').slice(0, 4);
       i.week_start = ws;
     });
-    store.tables.ShoppingItem = T().ShoppingItem.filter(function (i) { return i.week_start !== ws; }).concat(items);
-    save(true);
+    lastItems = {}; items.forEach(function (i) { lastItems[i.item_id] = i; });
     return items;
   }
   function itemQty(i) {
@@ -383,7 +501,7 @@
   // ---- Einstellungen
   function viewSettings() {
     var check = EP.verifyLedger(store);
-    var h = '<div class="note">Demo-Modus: Beispieldaten nur auf diesem Gerät. Deine echten Bestände und die ChatGPT-Version werden nicht berührt.</div>';
+    var h = viewConnection();
     h += '<div class="sec">Produkte & Packungsregeln</div><div class="panel">' + T().Product.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (p) {
       var k = pkgOf(p);
       return '<div class="row tap" data-action="edit-product" data-id="' + p.product_id + '"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + esc(p.category) + ' · Basiseinheit ' + esc(p.base_unit) + '</div></div><div class="small ' + (k ? '' : 'muted') + '">' + (k ? esc(k.label) : 'keine Packung') + '</div></div>';
@@ -400,11 +518,45 @@
       '<div class="row"><div class="grow"><div class="title">Bestand = Summe aller Buchungen</div><div class="sub">' + T().StockEvent.length + ' Buchungen im Journal</div></div>' + (check.ok ? '<span class="tag ok">geprüft ✓</span>' : '<span class="tag bad">' + check.problems.length + ' Abweichung(en)</span>') + '</div>' +
       '<div class="row tap" data-action="journal"><div class="grow"><div class="title">Buchungsjournal ansehen</div></div><span class="muted">›</span></div>' +
       '<div class="row tap" data-action="export"><div class="grow"><div class="title">Daten exportieren (JSON)</div></div><span class="muted">›</span></div>' +
-      '<div class="row tap" data-action="reset"><div class="grow"><div class="title" style="color:var(--bad)">Beispieldaten zurücksetzen</div></div></div></div>';
-    h += '<div class="sec">Familienzugang</div><div class="card small">Kommt mit der Online-Datenbasis: Anmeldung mit Google, Zugangsanfrage per E-Mail an den Besitzer, Zugriff erst nach deiner Freigabe.</div>';
-    h += '<div class="sec">Sprache</div><div class="card small">' + (speechSupported() ? 'Spracheingabe über die Spracherkennung des Browsers ist verfügbar.' : 'Dieser Browser bietet keine direkte Spracherkennung. Nutze das Mikrofon der Tastatur (Diktat), das funktioniert genauso.') + ' Verstandener Text wird regelbasiert ausgewertet. Es fallen keine KI-Kosten an.</div>';
-    h += '<p class="small muted" style="margin:16px 4px">Tischlein, Demo-Version 0.2 (Claude-Variante des Familien-Einkaufsplaners)</p>';
+      (Net.live() ? '<div class="row tap" data-action="resync"><div class="grow"><div class="title">Neu laden</div><div class="sub">Stand ' + rev + '</div></div><span class="muted">›</span></div></div>' :
+      '<div class="row tap" data-action="reset"><div class="grow"><div class="title" style="color:var(--bad)">Beispieldaten zurücksetzen</div></div></div></div>');
+    h += viewFamily();
+    h += '<div class="sec">Sprache</div><div class="card small">' + (useAI() ? 'Diktat mit KI: Aufnahme wird von OpenAI (' + esc(ai.transcribe_model) + ') verschriftet und von ' + esc(ai.text_model) + ' in Aktionen zerlegt. Du bestätigst immer selbst; die KI bucht nie. Kosten: etwa 0,1 Cent je Satz.' :
+      (speechSupported() ? 'Spracheingabe über die Spracherkennung des Browsers.' : 'Dieser Browser bietet keine direkte Spracherkennung. Nutze das Mikrofon der Tastatur (Diktat).') + ' Verstandener Text wird regelbasiert ausgewertet. Es fallen keine KI-Kosten an.' + (Net.live() && !ai.configured ? ' KI-Diktat lässt sich im Backend mit einem OpenAI-Schlüssel einschalten.' : '')) + '</div>';
+    h += '<p class="small muted" style="margin:16px 4px">Tischlein 1.0 (Claude-Variante des Familien-Einkaufsplaners)</p>';
     return h;
+  }
+
+  function viewConnection() {
+    var c = Net.conf();
+    if (!Net.live()) {
+      return '<div class="note">Demo-Modus: Beispieldaten nur auf diesem Gerät. Deine echten Bestände und die ChatGPT-Version werden nicht berührt.</div>' +
+        '<div class="sec">Mit Google-Tabelle verbinden</div><div class="card">' +
+        '<div class="field"><label for="connUrl">Backend-Adresse (Apps Script, endet auf /exec)</label><input id="connUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://script.google.com/macros/s/…/exec" value="' + esc(c.backendUrl) + '"></div>' +
+        '<div class="field"><label for="connCid">Google-Client-ID</label><input id="connCid" type="text" autocomplete="off" placeholder="…apps.googleusercontent.com" value="' + esc(c.clientId) + '"></div>' +
+        '<button class="btn primary block" data-action="conn-save">Verbinden</button></div>';
+    }
+    return '<div class="sec">Konto & Datenbasis</div><div class="panel">' +
+      '<div class="row"><div class="grow"><div class="title">' + esc(auth.name || auth.email || '') + '</div><div class="sub">' + esc(auth.email || '') + ' · ' + (auth.owner ? 'Besitzer' : 'Mitnutzer') + '</div></div><button class="link" data-action="logout">Abmelden</button></div>' +
+      '<div class="row"><div class="grow"><div class="title">Datenbasis</div><div class="sub">' + (c.env === 'TEST' ? 'Testdaten – zum Ausprobieren' : 'Echte Daten') + '</div></div>' +
+      '<div class="seg" style="width:170px"><button class="' + (c.env === 'TEST' ? 'on' : '') + '" data-action="conn-env" data-v="TEST">Test</button><button class="' + (c.env === 'PROD' ? 'on' : '') + '" data-action="conn-env" data-v="PROD">Echt</button></div></div>' +
+      (auth.owner ? '<div class="row tap" data-action="conn-demo"><div class="grow"><div class="title">Verbindung trennen (Demo-Modus)</div></div></div>' : '') + '</div>';
+  }
+  function viewFamily() {
+    if (!Net.live()) return '<div class="sec">Familienzugang</div><div class="card small">Nach dem Verbinden: Anmeldung mit Google, Zugangsanfrage per E-Mail an den Besitzer, Zugriff erst nach Freigabe.</div>';
+    if (!auth.owner) return '';
+    var h = '<div class="sec">Familienzugang</div>';
+    if (!users) return h + '<div class="panel"><div class="row tap" data-action="users-load"><div class="grow"><div class="title">Personen & Anfragen anzeigen</div></div><span class="muted">›</span></div></div>';
+    var order = { angefragt: 0, freigegeben: 1, abgelehnt: 2 };
+    return h + '<div class="panel">' + users.slice().sort(function (a, b) { return (a.role === 'owner' ? -1 : order[a.status] || 0) - (b.role === 'owner' ? -1 : order[b.status] || 0); }).map(function (u) {
+      var right = u.role === 'owner' ? '<span class="tag ok">Besitzer</span>' :
+        u.status === 'angefragt' ? '<button class="mini" data-action="user-decide" data-email="' + esc(u.email) + '" data-v="0">Ablehnen</button> <button class="mini primary" data-action="user-decide" data-email="' + esc(u.email) + '" data-v="1">Freigeben</button>' :
+        u.status === 'freigegeben' ? '<button class="link" data-action="user-decide" data-email="' + esc(u.email) + '" data-v="0">Entziehen</button>' :
+        '<button class="link" data-action="user-decide" data-email="' + esc(u.email) + '" data-v="1">Doch freigeben</button>';
+      var who = '<div class="grow" style="min-width:0"><div class="title">' + esc(u.name || u.email) + '</div><div class="sub" style="overflow-wrap:anywhere">' + esc(u.email) + (u.status === 'angefragt' ? ' · wartet auf Freigabe' : u.status === 'abgelehnt' ? ' · kein Zugang' : '') + '</div></div>';
+      if (u.role !== 'owner' && u.status === 'angefragt') return '<div class="row" style="flex-wrap:wrap">' + who + '<div class="btn-row" style="width:100%;margin-top:8px">' + right.replace(/class="mini/g, 'class="btn') + '</div></div>';
+      return '<div class="row">' + who + '<div style="white-space:nowrap">' + right + '</div></div>';
+    }).join('') + '</div><p class="small muted" style="margin:8px 6px">Neue Person: App-Link schicken, sie meldet sich mit Google an und tippt „Zugang anfragen“. Du bekommst eine E-Mail.</p>';
   }
 
   var VIEWS = { today: viewToday, week: viewWeek, cookbook: viewCookbook, shopping: viewShopping, offers: viewOffers, pantry: viewPantry, settings: viewSettings };
@@ -413,6 +565,7 @@
   function openSheet(s) { sheet = s; renderSheet(); $('sheet').classList.add('open'); $('backdrop').classList.add('open'); }
   function closeSheet() {
     if (recognition) { try { recognition.stop(); } catch (e) {} recognition = null; }
+    if (media) { try { media.rec.onstop = null; media.rec.stop(); media.stream.getTracks().forEach(function (t) { t.stop(); }); clearTimeout(media.timer); } catch (e) {} media = null; }
     sheet = null; $('sheet').classList.remove('open'); $('backdrop').classList.remove('open'); render();
   }
   function head(title) { return '<div class="grab"></div><div class="sheet-head"><h3 id="sheetTitle">' + title + '</h3><button class="x" data-action="close-sheet" aria-label="Schließen"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>'; }
@@ -532,11 +685,12 @@
 
     voice: function () {
       var h = head(sheet.listMode ? 'Auf die Einkaufsliste' : 'Sag, was sich geändert hat');
-      h += '<button class="mic-big' + (recognition ? ' live' : '') + '" data-action="mic" aria-label="Aufnahme"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>';
-      if (!speechSupported()) h += '<p class="small muted" style="text-align:center;margin-top:-6px">Tippe ins Textfeld und nutze das Mikrofon der Tastatur.</p>';
+      h += '<button class="mic-big' + (recognition || media ? ' live' : '') + '" data-action="mic" aria-label="' + (media ? 'Aufnahme beenden' : 'Aufnahme starten') + '"><svg viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>';
+      if (useAI()) h += '<p class="small muted" style="text-align:center;margin-top:-6px">' + (media ? 'Ich höre zu … Tippe nochmal, wenn du fertig bist.' : sheet.thinking ? 'Ich werte aus …' : 'Tippen, sprechen, nochmal tippen. Mit KI ausgewertet.') + '</p>';
+      else if (!speechSupported()) h += '<p class="small muted" style="text-align:center;margin-top:-6px">Tippe ins Textfeld und nutze das Mikrofon der Tastatur.</p>';
       h += '<div class="field"><textarea id="voiceText" data-voice="text" placeholder="' + (sheet.listMode ? 'z. B. Milch, zwei Gurken und Spülmittel' : 'z. B. Wir haben noch drei Äpfel, eine Gurke und Maasdamer, haltbar bis 15. Dezember') + '">' + esc(sheet.text) + '</textarea></div>';
       if (!sheet.listMode) h += '<div class="seg" style="margin-bottom:12px"><button class="' + (!sheet.inventur ? 'on' : '') + '" data-action="voice-mode" data-v="0">Normal</button><button class="' + (sheet.inventur ? 'on' : '') + '" data-action="voice-mode" data-v="1">Inventur („noch“ = gesamt)</button></div>';
-      h += '<button class="btn block" data-action="voice-parse">Verstehen</button>';
+      h += '<button class="btn block" data-action="voice-parse"' + (sheet.thinking ? ' disabled' : '') + '>' + (sheet.thinking ? 'Werte aus …' : 'Verstehen') + '</button>';
       if (sheet.actions) {
         if (!sheet.actions.length) return h + '<div class="card muted" style="margin-top:12px">Ich habe kein Produkt erkannt. Formuliere es bitte etwas anders.</div>';
         h += '<div class="sec">Erkannt: ' + sheet.actions.length + ' Aktion(en)</div>';
@@ -624,7 +778,39 @@
 
   // ---- Sprache
   function speechSupported() { return !!(window.SpeechRecognition || window.webkitSpeechRecognition); }
+  /** KI-Diktat: Aufnahme im Browser (MediaRecorder), Verschriftung serverseitig. Zweiter Tipp beendet. */
+  function startRecording() {
+    if (media) { media.rec.stop(); return; }
+    if (!navigator.mediaDevices || !window.MediaRecorder) { toast('Aufnahme wird hier nicht unterstützt – nutze das Mikrofon der Tastatur', true); var ta0 = $('voiceText'); if (ta0) ta0.focus(); return; }
+    navigator.mediaDevices.getUserMedia({ audio: true }).then(function (stream) {
+      var type = ['audio/mp4', 'audio/webm;codecs=opus', 'audio/webm'].filter(function (t) { return MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t); })[0] || '';
+      var rec = new MediaRecorder(stream, type ? { mimeType: type } : undefined), chunks = [];
+      var sh = sheet;
+      media = { rec: rec, stream: stream, timer: setTimeout(function () { if (rec.state === 'recording') rec.stop(); }, 60000) };
+      rec.ondataavailable = function (e) { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.onstop = function () {
+        clearTimeout(media.timer); stream.getTracks().forEach(function (t) { t.stop(); }); media = null;
+        var blob = new Blob(chunks, { type: rec.mimeType || type || 'audio/mp4' });
+        if (!blob.size || sheet !== sh) { renderSheet(); return; }
+        sh.thinking = true; renderSheet();
+        var fr = new FileReader();
+        fr.onload = function () {
+          var b64 = String(fr.result).split(',')[1];
+          Net.call('transcribe', { audio: b64, mime: blob.type }, { timeout: 90000 }).then(function (r) {
+            if (sheet !== sh) return;
+            sh.thinking = false;
+            if (!r.ok) { toast((r.message || 'Verschriftung fehlgeschlagen') + ' – tippe den Satz oder nutze das Tastatur-Diktat.', true); renderSheet(); return; }
+            sh.text = (sh.text ? sh.text + ' ' : '') + r.text;
+            if (sh.text.trim()) interpretAI(); else { toast('Nichts verstanden – bitte nochmal', true); renderSheet(); }
+          });
+        };
+        fr.readAsDataURL(blob);
+      };
+      rec.start(); renderSheet();
+    }).catch(function () { toast('Mikrofon nicht erlaubt. Erlaube es in den Einstellungen oder nutze das Tastatur-Diktat.', true); });
+  }
   function startMic() {
+    if (useAI()) return startRecording();
     if (recognition) { try { recognition.stop(); } catch (e) {} return; }
     if (!speechSupported()) { var ta = $('voiceText'); if (ta) ta.focus(); return; }
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -644,8 +830,21 @@
     var l = T().Location.filter(function (x) { return x.name === map[h]; })[0];
     return l ? l.location_id : '';
   }
+  function useAI() { return Net.live() && auth.phase === 'ready' && ai.configured; }
   function parseVoiceSheet() {
-    var acts = EP.parseVoice(sheet.text, today(), sheet.inventur ? 'inventur' : null);
+    if (useAI()) return interpretAI();
+    applyActions(EP.parseVoice(sheet.text, today(), sheet.inventur ? 'inventur' : null));
+  }
+  function interpretAI() {
+    var sh = sheet; sh.thinking = true; renderSheet();
+    Net.call('interpret', { text: sh.text, mode: sh.listMode ? 'liste' : sh.inventur ? 'inventur' : '', today: today() }).then(function (r) {
+      sh.thinking = false;
+      if (sheet !== sh) return;
+      if (!r.ok) { toast((r.message || 'KI nicht erreichbar') + ' – ich werte regelbasiert aus.', true); applyActions(EP.parseVoice(sh.text, today(), sh.inventur ? 'inventur' : null)); return; }
+      applyActions(r.actions);
+    });
+  }
+  function applyActions(acts) {
     sheet.actions = acts.map(function (a) {
       var r = EP.resolveProduct(store, a.product_text);
       var pid = r.status === 'resolved' ? r.product_id : '';
@@ -731,8 +930,10 @@
     'act-intent': function (el) { var a = sheet.actions[+el.getAttribute('data-idx')]; a.intent = el.getAttribute('data-v'); a.question = ''; renderSheet(); },
     'voice-book': function (el) {
       if (sheet.listMode) {
-        sheet.actions.forEach(function (a) { addManualItem(a.product_id, a.product_id ? product(a.product_id).name : a.newName, a.qty === '' ? null : Number(a.qty)); });
-        toast(sheet.actions.length + ' auf der Liste'); closeSheet(); return;
+        var n0 = sheet.actions.length;
+        addManualItems(sheet.actions.map(function (a) { return { pid: a.product_id, text: a.product_id ? product(a.product_id).name : a.newName, qty: a.qty === '' ? null : Number(a.qty) }; }), sheet.key)
+          .then(function (r) { if (r) { toast(n0 + ' auf der Liste'); closeSheet(); } });
+        return;
       }
       el.disabled = true;
       var cmds = [];
@@ -744,8 +945,10 @@
         else if (a.intent === 'set') cmds.push({ type: 'set_total', product_id: pid, location_id: a.loc, qty: Number(a.qty), unit: a.unit, best_before: a.bb, note: note });
         else cmds.push({ type: 'adjust', product_id: pid, location_id: a.loc, qty: a.intent === 'remove' ? -Number(a.qty) : Number(a.qty), unit: a.unit, best_before: a.bb, note: note });
       });
-      var r = run({ type: 'batch', commands: cmds }, sheet.key);
-      if (r) { toast(r.replayed ? 'War bereits gebucht' : sheet.actions.length + ' Änderung(en) gebucht ✓'); closeSheet(); } else el.disabled = false;
+      var n1 = sheet.actions.length;
+      run({ type: 'batch', commands: cmds }, sheet.key).then(function (r) {
+        if (r) { toast(r.replayed ? 'War bereits gebucht' : n1 + ' Änderung(en) gebucht ✓'); closeSheet(); } else el.disabled = false;
+      });
     },
 
     cook: function (el) {
@@ -754,57 +957,71 @@
       var e = entry ? T().MealPlanEntry.filter(function (x) { return x.entry_id === entry; })[0] : null;
       var persons = Number(el.getAttribute('data-persons')) || (e ? Number(e.persons) : Number(recipe(rid).servings_base));
       if (!e) { var te = entryFor(today()); if (te && te.recipe_id === rid) e = te; }
-      openSheet({ type: 'cook', recipe_id: rid, entry_id: e ? e.entry_id : '', persons: persons, overrides: {}, key: uuid() });
+      openSheet({ type: 'cook', recipe_id: rid, entry_id: e ? e.entry_id : '', entry: e ? clean(e) : null, persons: persons, overrides: {}, key: uuid() });
     },
     'cook-persons': function (el) { sheet.persons = Math.max(1, sheet.persons + Number(el.getAttribute('data-d'))); sheet.overrides = {}; renderSheet(); },
     'cook-skip': function (el) { var n = el.getAttribute('data-line'); if (sheet.overrides[n] && sheet.overrides[n].skip) delete sheet.overrides[n]; else sheet.overrides[n] = { skip: true }; renderSheet(); },
     'cook-confirm': function (el) {
       el.disabled = true;
-      var r = run({ type: 'cook', recipe_id: sheet.recipe_id, persons: sheet.persons, overrides: sheet.overrides, meal_plan_entry_id: sheet.entry_id || undefined, date: today() }, sheet.key);
-      if (r) { sheet.result = r; renderSheet(); toast(r.replayed ? 'War bereits gebucht, nichts doppelt abgezogen' : 'Abgebucht ✓'); } else el.disabled = false;
+      var sh = sheet;
+      run({ type: 'cook', recipe_id: sh.recipe_id, persons: sh.persons, overrides: sh.overrides, meal_plan_entry_id: sh.entry_id || undefined, meal_plan_entry: sh.entry || undefined, date: today() }, sh.key).then(function (r) {
+        if (r) { sh.result = r; if (sheet === sh) renderSheet(); toast(r.replayed ? 'War bereits gebucht, nichts doppelt abgezogen' : 'Abgebucht ✓'); } else el.disabled = false;
+      });
     },
 
     recipe: function (el) { var r = recipe(el.getAttribute('data-id')); openSheet({ type: 'recipe', id: r.recipe_id, persons: Number(el.getAttribute('data-persons')) || Number(r.servings_base) || 2 }); },
     'recipe-persons': function (el) { sheet.persons = Math.max(1, sheet.persons + Number(el.getAttribute('data-d'))); renderSheet(); },
-    fav: function (el) { var r = recipe(el.getAttribute('data-id')); r.favorite = !r.favorite; save(); renderSheet(); },
-    dislike: function (el) { var r = recipe(el.getAttribute('data-id')); r.disliked = !r.disliked; save(); renderSheet(); },
+    fav: function (el) { var r = recipe(el.getAttribute('data-id')); upsert('Recipe', [{ recipe_id: r.recipe_id, favorite: !r.favorite }]).then(function () { renderSheet(); }); },
+    dislike: function (el) { var r = recipe(el.getAttribute('data-id')); upsert('Recipe', [{ recipe_id: r.recipe_id, disliked: !r.disliked }]).then(function () { renderSheet(); }); },
     'new-recipe': function () { openSheet({ type: 'newRecipe', draft: { name: '', minutes: 20, servings: 2, category: 'Schnell', ingredients: '', steps: '', url: '' } }); },
     'save-recipe': function () {
-      var d = sheet.draft, id = 'R-' + uuid().slice(0, 8).toUpperCase();
-      T().Recipe.push({ recipe_id: id, name: d.name.trim(), category: d.category, servings_base: Number(d.servings) || 2, minutes: Number(d.minutes) || '', steps: d.steps, source_url: d.url, favorite: false, disliked: false, repeat_every_days: 7, notes: '', version: 1, updated_at: new Date().toISOString() });
-      parseIngredients(d.ingredients).forEach(function (x, i) { T().RecipeIngredient.push({ recipe_id: id, line_no: i + 1, product_id: x.product_id, text_original: x.text, qty: x.qty == null ? '' : x.qty, unit: x.unit, per: x.per, optional: false, note: '' }); });
-      if (save()) { toast('Rezept gespeichert'); closeSheet(); }
+      var d = sheet.draft, id = sheet.draftId || (sheet.draftId = 'R-' + uuid().slice(0, 8).toUpperCase());
+      if (!d.name.trim()) return toast('Bitte einen Namen eingeben', true);
+      var ings = parseIngredients(d.ingredients).map(function (x, i) { return { recipe_id: id, line_no: i + 1, product_id: x.product_id, text_original: x.text, qty: x.qty == null ? '' : x.qty, unit: x.unit, per: x.per, optional: false, note: '' }; });
+      var cmds = [{ type: 'upsert_rows', table: 'Recipe', rows: [{ recipe_id: id, name: d.name.trim(), category: d.category, servings_base: Number(d.servings) || 2, minutes: Number(d.minutes) || '', steps: d.steps, source_url: d.url, favorite: false, disliked: false, repeat_every_days: 7, notes: '', version: 1 }] }];
+      if (ings.length) cmds.push({ type: 'upsert_rows', table: 'RecipeIngredient', rows: ings });
+      sheet.saveKey = sheet.saveKey || uuid();
+      run({ type: 'batch', commands: cmds }, sheet.saveKey).then(function (r) { if (r) { toast('Rezept gespeichert'); closeSheet(); } });
     },
 
     'week-nav': function (el) { state.weekOffset += Number(el.getAttribute('data-d')); render(); },
     persons: function (el) {
       var e = T().MealPlanEntry.filter(function (x) { return x.entry_id === el.getAttribute('data-entry'); })[0];
-      e.persons = Math.max(0, Number(e.persons) + Number(el.getAttribute('data-d'))); e.updated_at = new Date().toISOString(); save(); render();
+      upsert('MealPlanEntry', [Object.assign({}, e, { persons: Math.max(0, Number(e.persons) + Number(el.getAttribute('data-d'))) })]);
     },
     suggest: function () { suggestWeek(); render(); },
     'confirm-plan': function () {
-      var ws = weekStart(state.weekOffset), n = 0;
-      T().MealPlanEntry.forEach(function (e) { if (e.date >= ws && e.date <= addDays(ws, 6) && e.status === 'Vorschlag') { e.status = 'bestätigt'; n++; } });
-      if (save()) toast(n + ' Tag(e) bestätigt, Einkaufsliste aktualisiert'); render();
+      var ws = weekStart(state.weekOffset);
+      var rows = T().MealPlanEntry.filter(function (e) { return e.date >= ws && e.date <= addDays(ws, 6) && e.status === 'Vorschlag'; }).map(function (e) { return Object.assign({}, e, { status: 'bestätigt' }); });
+      if (!rows.length) return;
+      upsert('MealPlanEntry', rows).then(function (r) { if (r) toast(rows.length + ' Tag(e) bestätigt, Einkaufsliste aktualisiert'); });
     },
 
     'shop-check': function (el) {
-      var i = T().ShoppingItem.filter(function (x) { return x.item_id === el.getAttribute('data-item'); })[0];
-      if (!i || i.purchase_id) return; i.checked = !i.checked; save(); render();
+      var i = itemRow(el.getAttribute('data-item'));
+      if (!i || i.purchase_id) return;
+      i.checked = !i.checked; render(); // sofort sichtbar; Server bestätigt oder setzt zurück
+      upsert('ShoppingItem', [Object.assign({}, i)]).then(function (r) { if (!r) { i.checked = !i.checked; render(); } });
     },
     'add-item': function () {
       var inp = $('addItem'); var txt = inp.value.trim(); if (!txt) return;
       var a = EP.parseVoice(txt)[0] || { product_text: txt, qty: null };
       var r = EP.resolveProduct(store, a.product_text);
-      addManualItem(r.status === 'resolved' ? r.product_id : '', r.status === 'resolved' ? product(r.product_id).name : cap(a.product_text || txt), a.qty);
-      render(); toast('Hinzugefügt');
+      inp.value = '';
+      addManualItems([{ pid: r.status === 'resolved' ? r.product_id : '', text: r.status === 'resolved' ? product(r.product_id).name : cap(a.product_text || txt), qty: a.qty }])
+        .then(function (res) { if (res) toast('Hinzugefügt'); else inp.value = txt; });
     },
     'shop-edit': function (el) { openSheet({ type: 'shopEdit', id: el.getAttribute('data-item') }); },
-    'shop-ovr-save': function () { var i = T().ShoppingItem.filter(function (x) { return x.item_id === sheet.id; })[0]; i.manual_override = Number($('ovr').value); save(); closeSheet(); },
-    'shop-ovr-clear': function () { var i = T().ShoppingItem.filter(function (x) { return x.item_id === sheet.id; })[0]; i.manual_override = ''; save(); closeSheet(); },
-    'shop-remove': function () { store.tables.ShoppingItem = T().ShoppingItem.filter(function (x) { return x.item_id !== sheet.id; }); save(); closeSheet(); },
+    'shop-ovr-save': function () { var i = itemRow(sheet.id), v = $('ovr').value; if (v === '' || isNaN(Number(v))) return toast('Bitte eine Zahl eingeben', true); upsert('ShoppingItem', [Object.assign({}, i, { manual_override: Number(v) })]).then(function (r) { if (r) closeSheet(); }); },
+    'shop-ovr-clear': function () { var i = itemRow(sheet.id); upsert('ShoppingItem', [Object.assign({}, i, { manual_override: '' })]).then(function (r) { if (r) closeSheet(); }); },
+    'shop-remove': function () {
+      var i = itemRow(sheet.id);
+      var p = i.origin === 'manuell' ? run({ type: 'delete_rows', table: 'ShoppingItem', match: [{ item_id: i.item_id }] })
+        : upsert('ShoppingItem', [Object.assign({}, i, { manual_override: 0, checked: true })]); // aus dem Plan berechnet: auf 0 setzen statt löschen, sonst käme sie wieder
+      p.then(function (r) { if (r) closeSheet(); });
+    },
     'book-checked': function () {
-      var items = T().ShoppingItem.filter(function (i) { return i.week_start === weekStart(0) && i.checked && !i.purchase_id; });
+      var items = shoppingItems().filter(function (i) { return i.checked && !i.purchase_id && !(Number(i.manual_override) === 0 && i.manual_override !== '' && i.manual_override != null); });
       var deptLoc = { 'Tiefkühl': 'TK', 'Kühlregal': 'KS', 'Obst & Gemüse': 'KS' };
       openSheet({ type: 'bookChecked', key: uuid(), lines: items.map(function (i) {
         var p = i.product_id ? product(i.product_id) : null;
@@ -819,11 +1036,14 @@
       var missing = lines.filter(function (l) { return !l.loc || l.qty === '' || isNaN(Number(l.qty)); });
       if (missing.length) return toast('Bitte Menge und Ort für alle Positionen angeben', true);
       el.disabled = true;
-      var r = lines.length ? run({ type: 'purchase', source: 'liste', date: today(), lines: lines.map(function (l) { return { product_id: l.product_id, qty: Number(l.qty), unit: l.unit, location_id: l.loc, best_before: l.bb, shopping_item_id: l.item_id }; }) }, sheet.key) : { booked: [], skipped: [] };
-      if (r) {
-        sheet.lines.filter(function (l) { return !l.product_id; }).forEach(function (l) { store.tables.ShoppingItem = T().ShoppingItem.filter(function (x) { return x.item_id !== l.item_id; }); });
-        save(); sheet.result = r; renderSheet(); toast('Eingebucht ✓');
-      } else el.disabled = false;
+      var sh = sheet, cmds = [];
+      if (lines.length) cmds.push({ type: 'purchase', source: 'liste', date: today(), lines: lines.map(function (l) { return { product_id: l.product_id, qty: Number(l.qty), unit: l.unit, location_id: l.loc, best_before: l.bb, shopping_item_id: l.item_id }; }) });
+      var loose = sh.lines.filter(function (l) { return !l.product_id; });
+      if (loose.length) cmds.push({ type: 'delete_rows', table: 'ShoppingItem', match: loose.map(function (l) { return { item_id: l.item_id }; }) });
+      if (!cmds.length) { closeSheet(); return; }
+      run({ type: 'batch', commands: cmds }, sh.key).then(function (r) {
+        if (r) { sh.result = lines.length ? r.results[0] : { booked: [], skipped: [] }; if (sheet === sh) renderSheet(); toast('Eingebucht ✓'); } else el.disabled = false;
+      });
     },
 
     loc: function (el) { state.loc = el.getAttribute('data-id'); render(); },
@@ -837,17 +1057,20 @@
       el.disabled = true;
       var cmd = f.intent === 'set' ? { type: 'set_total', product_id: pid, location_id: f.loc, qty: Number(f.qty), unit: f.unit } :
         { type: 'adjust', product_id: pid, location_id: f.loc, qty: f.intent === 'remove' ? -Number(f.qty) : Number(f.qty), unit: f.unit, best_before: f.intent === 'add' ? f.bb : '' };
-      var r = run(cmd, sheet.key);
-      if (r) { toast('Gebucht ✓'); sheet.key = uuid(); sheet.form.qty = ''; sheet.form.bb = ''; }
-      renderSheet();
+      var sh = sheet;
+      run(cmd, sh.key).then(function (r) {
+        el.disabled = false;
+        if (r) { toast('Gebucht ✓'); sh.key = uuid(); sh.form.qty = ''; sh.form.bb = ''; }
+        if (sheet === sh) renderSheet();
+      });
     },
     'used-up': function () {
       var f = sheet.form; if (!f.loc) return toast('Bitte den Lagerort wählen', true);
       if (!confirm(product(sheet.id).name + ' im ' + locName(f.loc) + ' als aufgebraucht markieren?')) return;
-      var r = run({ type: 'used_up', product_id: sheet.id, location_id: f.loc }, sheet.key);
-      if (r) { toast('Als aufgebraucht gebucht'); sheet.key = uuid(); } renderSheet();
+      var sh = sheet;
+      run({ type: 'used_up', product_id: sh.id, location_id: f.loc }, sh.key).then(function (r) { if (r) { toast('Als aufgebraucht gebucht'); sh.key = uuid(); } if (sheet === sh) renderSheet(); });
     },
-    'open-lot': function (el) { var r = run({ type: 'open', lot_id: el.getAttribute('data-id') }, uuid()); if (r) toast('Als geöffnet markiert'); renderSheet(); },
+    'open-lot': function (el) { run({ type: 'open', lot_id: el.getAttribute('data-id') }).then(function (r) { if (r) toast('Als geöffnet markiert'); renderSheet(); }); },
     inventory: function (el) {
       var loc = el && el.getAttribute('data-loc') ? el.getAttribute('data-loc') : state.loc !== 'all' ? state.loc : '';
       openSheet({ type: 'inventory', loc: loc, rows: loc ? inventoryRows(loc) : [], key: uuid() });
@@ -855,28 +1078,68 @@
     'inv-save': function (el) {
       if (sheet.rows.some(function (r) { return r.qty === '' || isNaN(Number(r.qty)); })) return toast('Bitte für jedes Produkt eine Zahl eintragen (0 = leer)', true);
       el.disabled = true;
-      var r = run({ type: 'inventory', location_id: sheet.loc, mode: 'full', counts: sheet.rows.map(function (x) { return { product_id: x.product_id, qty: Number(x.qty), unit: product(x.product_id).base_unit }; }) }, sheet.key);
-      if (r) { toast('Inventur ' + locName(sheet.loc) + ' gespeichert ✓'); closeSheet(); } else el.disabled = false;
+      var loc = sheet.loc;
+      run({ type: 'inventory', location_id: loc, mode: 'full', counts: sheet.rows.map(function (x) { return { product_id: x.product_id, qty: Number(x.qty), unit: product(x.product_id).base_unit }; }) }, sheet.key).then(function (r) {
+        if (r) { toast('Inventur ' + locName(loc) + ' gespeichert ✓'); closeSheet(); } else el.disabled = false;
+      });
     },
     'new-product': function () { openSheet({ type: 'newProduct', form: { name: '', category: 'Sonstiges', unit: 'Stk' } }); },
-    'save-product': function () { var f = sheet.form; var r = run({ type: 'create_product', name: f.name, category: f.category, base_unit: f.unit }); if (r) { toast('Angelegt'); openSheet({ type: 'product', id: r.product_id, key: uuid(), form: { intent: 'add', qty: '', unit: f.unit, loc: state.loc !== 'all' ? state.loc : '', bb: '' } }); } },
+    'save-product': function () { var f = sheet.form; sheet.saveKey = sheet.saveKey || uuid(); run({ type: 'create_product', name: f.name, category: f.category, base_unit: f.unit }, sheet.saveKey).then(function (r) { if (r) { toast('Angelegt'); openSheet({ type: 'product', id: r.product_id, key: uuid(), form: { intent: 'add', qty: '', unit: f.unit, loc: state.loc !== 'all' ? state.loc : '', bb: '' } }); } }); },
     'edit-product': function (el) { var p = product(el.getAttribute('data-id')), k = pkgOf(p); openSheet({ type: 'editProduct', id: p.product_id, form: { label: k ? k.label : '', qty: k ? k.content_qty : '', unit: k ? k.content_unit : p.base_unit } }); },
     'save-package': function () {
       var f = sheet.form; if (!f.qty || isNaN(Number(f.qty))) return toast('Bitte den Inhalt angeben', true);
       var p = product(sheet.id);
-      var r = run({ type: 'confirm_package', product_id: p.product_id, package_id: p.default_package_id || undefined, label: f.label || 'Packung', content_qty: Number(f.qty), content_unit: f.unit, make_default: true });
-      if (r) { toast('Packungsregel gilt jetzt überall'); closeSheet(); }
+      run({ type: 'confirm_package', product_id: p.product_id, package_id: p.default_package_id || undefined, label: f.label || 'Packung', content_qty: Number(f.qty), content_unit: f.unit, make_default: true })
+        .then(function (r) { if (r) { toast('Packungsregel gilt jetzt überall'); closeSheet(); } });
     },
     'new-alias': function () { openSheet({ type: 'alias', form: { text: '', pid: '' } }); },
-    'save-alias': function () { var r = run({ type: 'confirm_alias', alias: sheet.form.text, product_id: sheet.form.pid, source: 'manuell' }); if (r) { toast('Regel gespeichert' + (r.recipe_ingredients_updated ? ', ' + r.recipe_ingredients_updated + ' Rezeptzutat(en) zugeordnet' : '')); closeSheet(); } },
+    'save-alias': function () { run({ type: 'confirm_alias', alias: sheet.form.text, product_id: sheet.form.pid, source: 'manuell' }).then(function (r) { if (r) { toast('Regel gespeichert' + (r.recipe_ingredients_updated ? ', ' + r.recipe_ingredients_updated + ' Rezeptzutat(en) zugeordnet' : '')); closeSheet(); } }); },
     'new-location': function () { openSheet({ type: 'newLocation' }); },
-    'save-location': function () { var r = run({ type: 'create_location', name: $('locName').value }); if (r) { toast('Lagerort angelegt'); closeSheet(); } },
+    'save-location': function () { run({ type: 'create_location', name: $('locName').value }).then(function (r) { if (r) { toast('Lagerort angelegt'); closeSheet(); } }); },
     journal: function () { openSheet({ type: 'journal' }); },
     export: function () {
       var blob = new Blob([JSON.stringify(store, null, 1)], { type: 'application/json' });
-      var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'einkaufsplaner-demo-' + today() + '.json'; a.click();
+      var a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'tischlein-' + (Net.live() ? Net.conf().env.toLowerCase() : 'demo') + '-' + today() + '.json'; a.click();
     },
-    reset: function () { if (!confirm('Alle Demo-Daten auf diesem Gerät zurücksetzen?')) return; localStorage.removeItem(STORE_KEY); store = null; load(); toast('Beispieldaten neu geladen'); render(); }
+    reset: function () { if (Net.live()) return; if (!confirm('Alle Demo-Daten auf diesem Gerät zurücksetzen?')) return; localStorage.removeItem(STORE_KEY); store = null; load(); toast('Beispieldaten neu geladen'); render(); },
+
+    // ---- Online: Anmeldung, Familie, Verbindung
+    'login-redirect': function () { Net.redirectLogin(); },
+    'access-request': function (el) {
+      el.disabled = true;
+      Net.call('request_access').then(function (r) {
+        el.disabled = false;
+        if (!r.ok) return netError(r);
+        auth.status = r.status;
+        if (r.allowed) { afterHello(r); return; }
+        toast(r.mailed ? 'Anfrage gesendet ✓' : 'Anfrage liegt bereits vor'); render();
+      });
+    },
+    'auth-check': function () { auth.phase = 'checking'; render(); Net.call('hello').then(afterHello); },
+    logout: function () { Net.logout(); Net.clearCache(); store = EP.newStore(); rev = 0; auth = { phase: 'login' }; users = null; render(); },
+    'users-load': function () { Net.call('users').then(function (r) { if (r.ok) { users = r.users; render(); } else netError(r); }); },
+    'user-decide': function (el) {
+      var email = el.getAttribute('data-email'), yes = el.getAttribute('data-v') === '1';
+      if (!yes && !confirm(email + ' den Zugang entziehen?')) return;
+      el.disabled = true;
+      Net.call('decide_access', { email: email, approve: yes }).then(function (r) {
+        if (r.ok) { users = r.users; toast(yes ? 'Freigegeben ✓' : 'Zugang entzogen'); render(); } else { el.disabled = false; netError(r); }
+      });
+    },
+    'conn-save': function () {
+      var url = ($('connUrl').value || '').trim(), cid = ($('connCid').value || '').trim();
+      if (url && !/^https:\/\/script\.google\.com\/macros\/s\/[\w-]+\/exec$/.test(url)) return toast('Die Backend-Adresse muss mit https://script.google.com/macros/s/ beginnen und auf /exec enden', true);
+      if (cid && !/\.apps\.googleusercontent\.com$/.test(cid)) return toast('Die Client-ID endet auf .apps.googleusercontent.com', true);
+      Net.setConf({ backendUrl: url, clientId: cid }); location.reload();
+    },
+    'conn-env': function (el) {
+      var env = el.getAttribute('data-v');
+      if (env === Net.conf().env) return;
+      if (env === 'PROD' && !confirm('Auf die echte Datenbasis (PROD) umschalten? Ab dann zählen alle Buchungen wirklich.')) return;
+      Net.setConf({ env: env }); location.reload();
+    },
+    'conn-demo': function () { if (!confirm('Verbindung trennen und zum Demo-Modus wechseln? Die Daten in der Google-Tabelle bleiben unverändert.')) return; Net.logout(); Net.clearCache(); Net.setConf({ backendUrl: '', clientId: '' }); location.reload(); },
+    resync: function () { refresh().then(function () { toast('Auf aktuellem Stand ✓'); }); }
   };
 
   function defaultUnit(pid) { var p = product(pid); return p.base_unit === 'Stk' ? 'Stk' : pkgOf(p) ? 'Pkg' : p.base_unit; }
@@ -885,11 +1148,13 @@
     T().StockLot.forEach(function (l) { if (l.location_id === loc && Number(l.qty_base) > 1e-9) pids[l.product_id] = true; });
     return Object.keys(pids).sort(function (a, b) { return product(a).name.localeCompare(product(b).name); }).map(function (pid) { var t = EP.totalStock(store, pid, loc); return { product_id: pid, before: t, qty: Math.round(t * 1000) / 1000 }; });
   }
-  function addManualItem(pid, text, qty) {
+  function addManualItems(list, key) {
     var ws = weekStart(0);
-    T().ShoppingItem.push({ item_id: 'SI-M-' + uuid().slice(0, 8), week_start: ws, product_id: pid || '', text: text, qty_needed: null, qty_available: null, qty_to_buy: qty, unit: pid ? product(pid).base_unit : '', department: pid ? product(pid).category : 'Sonstiges', origin: 'manuell', manual_override: '', checked: false, purchase_id: '', unclear_reason: '', updated_at: new Date().toISOString() });
-    save();
+    return upsertKeyed('ShoppingItem', list.map(function (x) {
+      return { item_id: 'SI-M-' + uuid().slice(0, 8), week_start: ws, product_id: x.pid || '', text: x.text, qty_needed: null, qty_available: null, qty_to_buy: x.qty == null ? null : x.qty, unit: x.pid ? product(x.pid).base_unit : '', department: x.pid ? product(x.pid).category : 'Sonstiges', origin: 'manuell', manual_override: '', checked: false, unclear_reason: '' };
+    }), key);
   }
+  function upsertKeyed(table, rows, key) { return run({ type: 'upsert_rows', table: table, rows: rows.map(clean) }, key); }
 
   // ------------------------------------------------------------- Ereignisse
   document.addEventListener('click', function (ev) {
@@ -912,7 +1177,7 @@
     var el = ev.target, ch = el.getAttribute('data-change');
     if (ch === 'plan-recipe') {
       var e = T().MealPlanEntry.filter(function (x) { return x.entry_id === el.getAttribute('data-entry'); })[0];
-      e.recipe_id = el.value; e.status = el.value ? 'Vorschlag' : ''; e.updated_at = new Date().toISOString(); save(); render(); return;
+      upsert('MealPlanEntry', [Object.assign({}, e, { recipe_id: el.value, status: el.value ? 'Vorschlag' : '', note: '' })]); return;
     }
     if (ch === 'cook-qty') { sheet.overrides[el.getAttribute('data-line')] = { qty: Number(el.value), unit: product(EP.previewCook(store, sheet.recipe_id, sheet.persons).lines.filter(function (l) { return String(l.line_no) === el.getAttribute('data-line'); })[0].product_id).base_unit }; renderSheet(); return; }
     if (ch === 'inv-loc') { sheet.loc = el.value; sheet.rows = el.value ? inventoryRows(el.value) : []; renderSheet(); return; }
@@ -943,5 +1208,6 @@
   load();
   renderChrome();
   render();
+  boot();
   window.__EP_APP = { store: function () { return store; }, run: run, actions: ACTIONS };
 })();
