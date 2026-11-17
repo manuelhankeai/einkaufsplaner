@@ -1,4 +1,4 @@
-# Einkaufsplaner (Claude-Variante)
+# Tischlein – Familien-Einkaufsplaner (Claude-Variante)
 
 Privater Familien-Einkaufs- und Abendessenplaner: Vorrat, Kochbuch, Wochenplan, Einkaufsliste, Kassenbons.
 
@@ -10,7 +10,7 @@ Privater Familien-Einkaufs- und Abendessenplaner: Vorrat, Kochbuch, Wochenplan, 
 |---|---|
 | `core/` | Gemeinsame Fachlogik (Buchungsjournal, Chargen/Packungen, Kochen, Einkaufsliste, Bon-Dubletten, Sprachparser). Läuft in Apps Script, Node und Browser. |
 | `tests/` | Automatisierte Tests, u. a. für alle 15 kritischen Fehlerfälle der Spezifikation. |
-| `index.html`, `app.js`, `app.css`, `seed.js` | Web-App (PWA). Läuft derzeit im Demo-Modus mit Beispieldaten im Browser. |
+| `index.html`, `app.js`, `app.css`, `illus.js`, `seed.js` | Web-App (PWA). Läuft derzeit im Demo-Modus mit Beispieldaten im Browser. |
 | `backend/` (Google Apps Script) | folgt |
 
 ## Tests ausführen

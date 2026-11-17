@@ -1,13 +1,13 @@
 {
-  "name": "Einkaufsplaner",
-  "short_name": "Einkauf",
-  "description": "Familien-Einkaufs- und Abendessenplaner",
+  "name": "Tischlein",
+  "short_name": "Tischlein",
+  "description": "Abendessen planen, Vorrat im Blick, einmal pro Woche einkaufen",
   "lang": "de",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
-  "background_color": "#F6F3EE",
-  "theme_color": "#2F6B4F",
+  "background_color": "#F2F4EF",
+  "theme_color": "#5B2763",
   "icons": [
     { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" },
     { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },

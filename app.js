@@ -26,6 +26,11 @@
   function dShort(isoDate) { if (!isoDate) return ''; var d = new Date(isoDate + 'T12:00:00'); return WD[d.getDay()] + ', ' + d.getDate() + '.' + (d.getMonth() + 1) + '.'; }
   function dNum(isoDate) { var d = new Date(isoDate + 'T12:00:00'); return d.getDate() + '.' + (d.getMonth() + 1) + '.'; }
   function niceOrigin(t) { return String(t || '').replace(/(\d{4}-\d{2}-\d{2})/g, function (d) { return WD[new Date(d + 'T12:00:00').getDay()]; }); }
+  function forDays(t) {
+    var days = []; String(t || '').replace(/(\d{4}-\d{2}-\d{2})/g, function (d) { var w = WD[new Date(d + 'T12:00:00').getDay()]; if (days.indexOf(w) < 0) days.push(w); });
+    if (!days.length) return '';
+    return 'für ' + (days.length > 1 ? days.slice(0, -1).join(', ') + ' und ' + days[days.length - 1] : days[0]);
+  }
   function fmtNum(n) { if (n == null || isNaN(n)) return '–'; var r = Math.round(n * 100) / 100; return String(r).replace('.', ','); }
 
   function T() { return store.tables; }
@@ -53,9 +58,9 @@
   function mhdPill(bb) {
     if (!bb) return '';
     var d = daysUntil(bb);
-    var cls = d < 0 ? 'bad' : d <= 3 ? 'warn' : 'neutral';
+    var cls = d < 0 ? 'bad' : d <= 3 ? 'warn' : 'plain';
     var txt = d < 0 ? 'abgelaufen ' + dNum(bb) : d === 0 ? 'MHD heute' : d === 1 ? 'MHD morgen' : 'MHD ' + dNum(bb);
-    return '<span class="pill ' + cls + '">' + txt + '</span>';
+    return '<span class="tag ' + cls + '">' + txt + '</span>';
   }
 
   // ------------------------------------------------------- Speicher & Buchung
@@ -89,13 +94,32 @@
   }
 
   // ------------------------------------------------------------- Rendering
+  var SUBTITLE = {
+    today: function () { var e = entryFor(today()); return e && e.recipe_id ? 'Heute Abend gibt es was Gutes' : 'Heute Abend ist noch offen'; },
+    week: function () { return 'Abendessen für sieben Tage'; },
+    cookbook: function () { return T().Recipe.length + ' Rezepte'; },
+    shopping: function () { var n = shoppingItems().filter(function (i) { return !i.checked && !i.unclear_reason; }).length; return n ? n + ' Dinge fehlen noch' : 'Alles im Haus'; },
+    offers: function () { return 'Nur geprüfte Preise'; },
+    pantry: function () { var n = {}; T().StockLot.forEach(function (l) { if (Number(l.qty_base) > 1e-9) n[l.product_id] = 1; }); return Object.keys(n).length + ' Produkte eingelagert'; },
+    settings: function () { return 'Regeln, Orte, Daten'; }
+  };
+  var SCENE_OF = { today: 'today', week: 'week', cookbook: 'cookbook', shopping: 'shopping', offers: 'offers', pantry: 'pantry' };
+  var TAB_ORDER = ['today', 'week', 'cookbook', 'shopping', 'offers', 'pantry'];
+  function renderChrome() {
+    $('tabbar').innerHTML = TAB_ORDER.map(function (t) { return '<button data-action="tab" data-tab="' + t + '" aria-label="' + TITLES[t] + '">' + Illus.tab(t) + '<span>' + TITLES[t] + '</span></button>'; }).join('');
+    $('fab').innerHTML = Illus.tab('mic');
+  }
   function render() {
-    $('title').textContent = TITLES[state.tab];
     var now = new Date();
-    $('eyebrow').textContent = WD_LONG[now.getDay()] + ', ' + now.getDate() + '. ' + now.toLocaleString('de-DE', { month: 'long' });
-    document.querySelectorAll('.tabbar button').forEach(function (b) { b.classList.toggle('on', b.getAttribute('data-tab') === state.tab); });
+    var dateTxt = WD_LONG[now.getDay()] + ', ' + now.getDate() + '. ' + now.toLocaleString('de-DE', { month: 'long' });
+    $('masthead').innerHTML = '<div><div class="brand">' + Illus.tab('pantry') + 'Tischlein<span class="demo-flag">Demo</span></div>' +
+      '<h1>' + TITLES[state.tab] + '</h1><div class="date">' + (state.tab === 'today' ? dateTxt : esc(SUBTITLE[state.tab]())) + '</div></div>' +
+      (SCENE_OF[state.tab] ? Illus.scene(SCENE_OF[state.tab]) : '<div></div>') +
+      (state.tab === 'settings' ? '' : '<button class="gear" data-action="tab" data-tab="settings" aria-label="Einstellungen">' + Illus.tab('settings') + '</button>');
+    document.querySelectorAll('.tabbar button').forEach(function (b) { b.classList.toggle('on', b.getAttribute('data-tab') === state.tab); b.setAttribute('aria-current', b.getAttribute('data-tab') === state.tab ? 'page' : 'false'); });
     var fn = VIEWS[state.tab];
     $('view').innerHTML = fn();
+    document.title = TITLES[state.tab] + ' – Tischlein';
   }
 
   function weekStart(offset) { return addDays(Seed.monday(new Date()), 7 * (offset || 0)); }
@@ -112,10 +136,10 @@
 
   function ingredientPills(pv) {
     return pv.lines.map(function (l) {
-      if (l.status === 'unklar') return '<span class="pill unclear" title="' + esc(l.reason) + '">? ' + esc(l.text) + '</span>';
+      if (l.status === 'unklar') return '<span class="tag unclear" title="' + esc(l.reason) + '">' + esc(l.text) + '?</span>';
       if (l.status !== 'ok') return '';
-      if (l.missing > 1e-9) return '<span class="pill warn">' + esc(l.text) + ' · fehlt ' + esc(fmtQty(l.product_id, l.missing, false)) + '</span>';
-      return '<span class="pill ok">✓ ' + esc(l.text) + '</span>';
+      if (l.missing > 1e-9) return '<span class="tag missing">' + esc(l.text) + ' fehlt</span>';
+      return '<span class="tag">' + esc(l.text) + '</span>';
     }).join('');
   }
 
@@ -125,30 +149,31 @@
     if (e && e.recipe_id && recipe(e.recipe_id)) {
       var r = recipe(e.recipe_id), pv = EP.previewCook(store, r.recipe_id, e.persons);
       var cooked = e.status === 'gekocht';
-      var planned = e.status === 'bestätigt';
-      h += '<div class="card hero"><div class="kicker">Heute Abend' + (cooked ? ' · gekocht ✓' : planned ? '' : ' · Vorschlag') + '</div>' +
-        '<h3>' + esc(r.name) + '</h3><div class="meta"><span>' + e.persons + ' Personen</span><span>' + esc(r.minutes) + ' Min.</span></div>' +
+      var missing = pv.lines.filter(function (l) { return l.status === 'ok' && l.missing > 1e-9; }).length;
+      h += '<section class="tonight">' + Illus.dish(r, 'dish lg') +
+        '<div class="when">' + (cooked ? 'Heute gekocht' : e.status === 'Vorschlag' ? 'Vorschlag für heute Abend' : 'Heute Abend') + '</div>' +
+        '<h2>' + esc(r.name) + '</h2><div class="facts"><span>' + e.persons + ' Personen</span><span>' + esc(r.minutes) + ' Minuten</span><span>' + (missing ? missing + ' Zutat' + (missing > 1 ? 'en fehlen' : ' fehlt') : 'Alles da') + '</span></div>' +
         '<div class="ing">' + ingredientPills(pv) + '</div>' +
         '<div class="btn-row"><button class="btn" data-action="recipe" data-id="' + r.recipe_id + '" data-persons="' + e.persons + '">Rezept</button>' +
-        '<button class="btn primary" data-action="cook" data-id="' + r.recipe_id + '" data-entry="' + e.entry_id + '">' + (cooked ? 'Nochmal gekocht…' : 'Gekocht') + '</button></div></div>';
+        '<button class="btn primary" data-action="cook" data-id="' + r.recipe_id + '" data-entry="' + e.entry_id + '">' + (cooked ? 'Nochmal gekocht' : 'Gekocht') + '</button></div></section>';
     } else {
-      h += '<div class="card"><div class="empty"><div class="big">🍽️</div>Für heute Abend ist nichts geplant.<br><br><button class="btn primary" data-action="tab" data-tab="week">Woche planen</button></div></div>';
+      h += '<div class="panel"><div class="empty">' + Illus.scene('today') + '<p>Für heute Abend steht noch nichts im Plan.</p><button class="btn primary" data-action="tab" data-tab="week">Woche planen</button></div></div>';
     }
     var tm = entryFor(addDays(t, 1));
     if (tm && tm.recipe_id && recipe(tm.recipe_id)) {
-      h += '<div class="list"><div class="row tap" data-action="tab" data-tab="week"><div class="grow"><div class="sub">Morgen</div><div class="title">' + esc(recipe(tm.recipe_id).name) + '</div></div><span class="muted">' + tm.persons + ' Pers.</span></div></div>';
+      h += '<div class="panel" style="margin-top:12px"><div class="row tap" data-action="tab" data-tab="week">' + Illus.dish(recipe(tm.recipe_id)) + '<div class="grow"><div class="sub">Morgen</div><div class="title">' + esc(recipe(tm.recipe_id).name) + '</div></div><span class="muted">' + tm.persons + ' Pers.</span></div></div>';
     }
     var soon = T().StockLot.filter(function (l) { return Number(l.qty_base) > 1e-9 && l.best_before && daysUntil(l.best_before) <= 4; })
-      .sort(function (a, b) { return a.best_before < b.best_before ? -1 : 1; }).slice(0, 5);
-    h += '<h2>Bald aufbrauchen</h2>';
-    h += soon.length ? '<div class="list">' + soon.map(function (l) {
+      .sort(function (a, b) { return a.best_before < b.best_before ? -1 : 1; }).slice(0, 8);
+    h += '<div class="sec">Bald aufbrauchen<span class="aside">' + (soon.length ? 'innerhalb von 4 Tagen' : '') + '</span></div>';
+    h += soon.length ? '<div class="strip">' + soon.map(function (l) {
       var p = product(l.product_id);
-      return '<div class="row tap" data-action="product" data-id="' + l.product_id + '"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + esc(fmtQty(l.product_id, Number(l.qty_base))) + ' · ' + esc(locName(l.location_id)) + (l.opened_at ? ' · angebrochen' : '') + '</div></div>' + mhdPill(l.best_before) + '</div>';
-    }).join('') + '</div>' : '<div class="card muted small">Nichts läuft in den nächsten 4 Tagen ab.</div>';
+      return '<div class="item" data-action="product" data-id="' + l.product_id + '" role="button" tabindex="0">' + Illus.dept(p.category) + '<div class="n">' + esc(p.name) + '</div><div class="q">' + esc(fmtQty(l.product_id, Number(l.qty_base), false)) + (l.opened_at ? ', offen' : '') + '</div><div style="margin-top:8px">' + mhdPill(l.best_before) + '</div></div>';
+    }).join('') + '</div>' : '<div class="panel"><div class="row"><span class="dot ok"></span><div class="grow">Nichts läuft in den nächsten Tagen ab.</div></div></div>';
     var items = shoppingItems();
     var open = items.filter(function (i) { return !i.checked && !i.unclear_reason; }).length;
     var unclear = items.filter(function (i) { return i.unclear_reason; }).length;
-    h += '<h2>Einkauf</h2><div class="list"><div class="row tap" data-action="tab" data-tab="shopping"><div class="grow"><div class="title">' + open + ' Artikel offen</div><div class="sub">' + (unclear ? unclear + ' unklar · ' : '') + 'für diese Woche</div></div><span class="muted">›</span></div></div>';
+    h += '<div class="sec">Einkauf</div><div class="panel"><div class="row tap" data-action="tab" data-tab="shopping">' + Illus.dept('Obst & Gemüse') + '<div class="grow"><div class="title">' + (open ? open + ' Artikel auf der Liste' : 'Nichts zu kaufen') + '</div><div class="sub">' + (unclear ? unclear + ' Zutaten ohne Menge im Rezept' : 'für diese Woche') + '</div></div><span class="muted">›</span></div></div>';
     return h;
   }
 
@@ -160,22 +185,25 @@
     var recipes = T().Recipe.filter(function (r) { return !r.disliked; }).sort(function (a, b) { return a.name.localeCompare(b.name); });
     var t = today();
     var proposals = entries.filter(function (e) { return e.status === 'Vorschlag'; }).length;
-    var h = '<div class="btn-row" style="margin-bottom:12px"><button class="mini" data-action="week-nav" data-d="-1">‹</button>' +
-      '<div style="flex:1;text-align:center;align-self:center;font-weight:650">' + dNum(ws) + ' – ' + dNum(addDays(ws, 6)) + (state.weekOffset === 0 ? ' · diese Woche' : '') + '</div>' +
-      '<button class="mini" data-action="week-nav" data-d="1">›</button></div>';
-    if (proposals) h += '<div class="note">' + proposals + ' Tag(e) mit Vorschlag. Erst nach „Plan bestätigen“ zählen sie für die Einkaufsliste. Der Bestand ändert sich erst beim Kochen.</div>';
-    h += '<div class="list">' + entries.map(function (e) {
+    var h = '<div class="btn-row" style="margin-bottom:14px;align-items:center"><button class="mini" data-action="week-nav" data-d="-1" aria-label="Vorherige Woche">‹</button>' +
+      '<div style="flex:1;text-align:center;font-weight:650">' + dNum(ws) + ' bis ' + dNum(addDays(ws, 6)) + '</div>' +
+      '<button class="mini" data-action="week-nav" data-d="1" aria-label="Nächste Woche">›</button></div>';
+    if (proposals) h += '<div class="note">' + proposals + (proposals > 1 ? ' Tage sind Vorschläge' : ' Tag ist ein Vorschlag') + '. Erst nach dem Bestätigen kommen sie auf die Einkaufsliste. Der Vorrat ändert sich erst beim Kochen.</div>';
+    h += '<div class="panel">' + entries.map(function (e) {
       var d = new Date(e.date + 'T12:00:00');
       var past = e.date < t;
-      var badge = e.status === 'gekocht' ? '<span class="pill ok">gekocht</span>' : e.status === 'Vorschlag' ? '<span class="pill warn">Vorschlag</span>' : '';
+      var r = e.recipe_id ? recipe(e.recipe_id) : null;
+      var state2 = e.status === 'gekocht' ? '<span class="state k">gekocht</span>' : e.status === 'Vorschlag' ? '<span class="state v">Vorschlag' + (e.note ? ', ' + esc(e.note) : '') + '</span>' : r ? '<span class="state">' + esc(r.minutes) + ' Min.</span>' : '<span class="state">frei</span>';
       return '<div class="row day' + (e.date === t ? ' today' : '') + '"><div class="d"><small>' + WD[d.getDay()] + '</small><b>' + d.getDate() + '</b></div>' +
-        '<div class="grow"><select data-change="plan-recipe" data-entry="' + e.entry_id + '"' + (past || e.status === 'gekocht' ? ' disabled' : '') + '><option value="">— nichts —</option>' +
-        recipes.map(function (r) { return '<option value="' + r.recipe_id + '"' + (r.recipe_id === e.recipe_id ? ' selected' : '') + '>' + esc(r.name) + ' · ' + esc(r.minutes) + ' Min.</option>'; }).join('') +
-        '</select><div class="sub" style="margin-top:4px">' + badge + '</div></div>' +
-        '<div class="stepper"><button data-action="persons" data-entry="' + e.entry_id + '" data-d="-1" aria-label="weniger">−</button><span>' + e.persons + '</span><button data-action="persons" data-entry="' + e.entry_id + '" data-d="1" aria-label="mehr">+</button></div></div>';
+        (r ? Illus.dish(r) : '<span></span>') +
+        '<div class="grow pick"><div class="title">' + (r ? esc(r.name) : '<span class="muted">Gericht wählen</span>') + '</div>' + state2 +
+        '<select data-change="plan-recipe" data-entry="' + e.entry_id + '" aria-label="Gericht am ' + WD_LONG[d.getDay()] + '"' + (past || e.status === 'gekocht' ? ' disabled' : '') + '><option value="">Nichts geplant</option>' +
+        recipes.map(function (x) { return '<option value="' + x.recipe_id + '"' + (x.recipe_id === e.recipe_id ? ' selected' : '') + '>' + esc(x.name) + '</option>'; }).join('') +
+        '</select></div>' +
+        '<div class="stepper" aria-label="Personen"><button data-action="persons" data-entry="' + e.entry_id + '" data-d="-1" aria-label="Eine Person weniger">−</button><span>' + e.persons + '</span><button data-action="persons" data-entry="' + e.entry_id + '" data-d="1" aria-label="Eine Person mehr">+</button></div></div>';
     }).join('') + '</div>';
-    h += '<div class="btn-row"><button class="btn" data-action="suggest">Lücken füllen</button><button class="btn primary" data-action="confirm-plan"' + (proposals ? '' : ' disabled') + '>Plan bestätigen</button></div>';
-    h += '<p class="small muted" style="margin:12px 4px">Vorschläge bevorzugen Rezepte mit bald ablaufenden Zutaten aus dem Vorrat, Favoriten und kurze Kochzeiten und vermeiden Wiederholungen in der Woche.</p>';
+    h += '<div class="btn-row"><button class="btn" data-action="suggest">Freie Tage füllen</button><button class="btn primary" data-action="confirm-plan"' + (proposals ? '' : ' disabled') + '>Plan bestätigen</button></div>';
+    h += '<p class="small muted" style="margin:12px 6px">Vorschläge nehmen bevorzugt, was bald abläuft oder schon offen ist, dann Favoriten und schnelle Gerichte. Wiederholungen in derselben Woche werden vermieden.</p>';
     return h;
   }
 
@@ -213,13 +241,14 @@
     var q = state.search.toLowerCase();
     var rs = T().Recipe.filter(function (r) { return !q || r.name.toLowerCase().indexOf(q) >= 0; })
       .sort(function (a, b) { return (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || a.name.localeCompare(b.name); });
-    var h = '<div class="inline-add"><input type="search" placeholder="Rezept suchen" value="' + esc(state.search) + '" data-input="cb-search"><button class="btn primary" data-action="new-recipe">+ Neu</button></div>';
-    h += '<div class="list">' + rs.map(function (r) {
-      var unclear = T().RecipeIngredient.filter(function (i) { return i.recipe_id === r.recipe_id && !i.product_id; }).length;
-      return '<div class="row tap" data-action="recipe" data-id="' + r.recipe_id + '"><div class="grow"><div class="title">' + (r.favorite ? '★ ' : '') + esc(r.name) + (r.disliked ? ' <span class="pill bad">unerwünscht</span>' : '') + '</div>' +
-        '<div class="sub">' + esc(r.minutes) + ' Min. · für ' + esc(r.servings_base) + ' · ' + esc(r.category || '') + (unclear ? ' · ' + unclear + ' Zutat(en) ohne Produkt' : '') + '</div></div><span class="muted">›</span></div>';
+    var h = '<div class="inline-add"><input type="search" placeholder="Rezept suchen" aria-label="Rezept suchen" value="' + esc(state.search) + '" data-input="cb-search"><button class="btn primary" data-action="new-recipe">Neues Rezept</button></div>';
+    h += '<div class="recipes">' + rs.map(function (r) {
+      return '<div class="rcard-wrap"><button class="rcard" data-action="recipe" data-id="' + r.recipe_id + '">' + Illus.dish(r) + '<b>' + esc(r.name) + '</b>' +
+        '<span class="m">' + esc(r.minutes) + ' Min., für ' + esc(r.servings_base) + '</span>' +
+        (r.disliked ? '<span class="tag bad">unerwünscht</span>' : '') + '</button>' +
+        (r.favorite ? '<span class="star" aria-label="Favorit">★</span>' : '') + '</div>';
     }).join('') + '</div>';
-    if (!rs.length) h += '<div class="empty">Kein Rezept gefunden.</div>';
+    if (!rs.length) h += '<div class="empty">Kein Rezept mit „' + esc(state.search) + '“. Leg es mit „Neues Rezept“ an.</div>';
     return h;
   }
 
@@ -237,7 +266,7 @@
     return items;
   }
   function itemQty(i) {
-    if (i.unclear_reason) return '<span class="pill unclear">Menge unklar</span>';
+    if (i.unclear_reason) return '<span class="tag unclear">Menge unklar</span>';
     if (i.manual_override !== undefined && i.manual_override !== '' && i.manual_override != null) return esc(fmtQty(i.product_id, Number(i.manual_override)));
     if (i.packages) return esc(i.packages + ' × ' + (i.package_label || 'Pkg'));
     if (i.qty_to_buy == null) return '';
@@ -245,27 +274,28 @@
   }
   function viewShopping() {
     var items = shoppingItems();
-    var h = '<div class="inline-add"><input type="text" id="addItem" placeholder="Artikel hinzufügen, z. B. 2 Gurken" enterkeyhint="done"><button class="btn primary" data-action="add-item">+</button></div>';
-    if (!items.length) return h + '<div class="card"><div class="empty"><div class="big">🛒</div>Alles da. Die Liste füllt sich aus dem bestätigten Wochenplan und den Mindestbeständen.</div></div>';
+    var h = '<div class="inline-add"><input type="text" id="addItem" placeholder="Was fehlt? z. B. 2 Gurken" aria-label="Artikel hinzufügen" enterkeyhint="done"><button class="btn primary" data-action="add-item" aria-label="Hinzufügen">+</button></div>';
+    if (!items.length) return h + '<div class="panel"><div class="empty">' + Illus.scene('shopping') + '<p>Alles im Haus. Die Liste füllt sich aus dem bestätigten Wochenplan und aus Mindestbeständen.</p></div></div>';
+    var done = items.filter(function (i) { return i.checked || i.purchase_id; }).length;
+    h += '<div class="progress" role="progressbar" aria-valuenow="' + done + '" aria-valuemax="' + items.length + '"><i style="width:' + Math.round(done / items.length * 100) + '%"></i></div><div class="small muted" style="margin:0 6px 4px">' + done + ' von ' + items.length + ' im Korb</div>';
     var groups = {};
     items.forEach(function (i) { (groups[i.department || 'Sonstiges'] = groups[i.department || 'Sonstiges'] || []).push(i); });
     var depts = Object.keys(groups).sort(function (a, b) { var x = DEPT_ORDER.indexOf(a), y = DEPT_ORDER.indexOf(b); return (x < 0 ? 50 : x) - (y < 0 ? 50 : y); });
     depts.forEach(function (d) {
-      h += '<h2>' + esc(d) + '</h2><div class="list">' + groups[d].map(function (i) {
+      h += '<div class="dept-head">' + Illus.dept(d) + '<b>' + esc(d) + '</b><span class="n">' + groups[d].length + '</span></div><div class="panel">' + groups[d].map(function (i) {
         var booked = !!i.purchase_id;
-        var sub = i.unclear_reason ? esc(i.unclear_reason) + (i.origin_detail ? ' · ' + esc(niceOrigin(i.origin_detail)) : '') :
-          i.origin === 'Mindestbestand' ? 'Mindestbestand · vorhanden ' + esc(fmtQty(i.product_id, i.qty_available || 0)) :
-          i.origin === 'manuell' ? 'manuell ergänzt' + (i.product_id ? '' : ' · kein Produkt zugeordnet') :
-          esc(niceOrigin(i.origin_detail)) + (i.qty_available > 0 ? ' · vorhanden ' + esc(fmtQty(i.product_id, i.qty_available, false)) : '');
-        if (i.leftover_after_cooking > 1e-9) sub += ' · Rest danach ' + esc(fmtQty(i.product_id, i.leftover_after_cooking, false));
-        return '<div class="row' + (i.checked ? ' done' : '') + '"><button class="check' + (i.checked ? ' on' : '') + '" data-action="shop-check" data-item="' + esc(i.item_id) + '" aria-label="abhaken"' + (booked ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>' +
+        var sub = i.unclear_reason ? esc(i.unclear_reason) + (i.origin_detail ? ', ' + esc(forDays(i.origin_detail)) : '') :
+          i.origin === 'Mindestbestand' ? 'Mindestbestand, vorhanden ' + esc(fmtQty(i.product_id, i.qty_available || 0, false)) :
+          i.origin === 'manuell' ? 'von Hand ergänzt' + (i.product_id ? '' : ', kein Produkt zugeordnet') :
+          esc(forDays(i.origin_detail)) + (i.qty_available > 0 ? ', ' + esc(fmtQty(i.product_id, i.qty_available, false)) + ' noch da' : '');
+        return '<div class="row' + (i.checked || booked ? ' done' : '') + '"><button class="check' + (i.checked || booked ? ' on' : '') + '" data-action="shop-check" data-item="' + esc(i.item_id) + '" aria-label="' + esc(i.text) + ' abhaken"' + (booked ? ' disabled' : '') + '><svg viewBox="0 0 24 24"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>' +
           '<div class="grow tap" data-action="shop-edit" data-item="' + esc(i.item_id) + '"><div class="title">' + esc(i.text) + '</div><div class="sub">' + sub + '</div></div>' +
-          '<div class="qty">' + (booked ? '<span class="pill ok">gebucht</span>' : itemQty(i)) + '</div></div>';
+          '<div class="qty">' + (booked ? '<span class="tag ok">im Vorrat</span>' : itemQty(i)) + '</div></div>';
       }).join('') + '</div>';
     });
     var n = items.filter(function (i) { return i.checked && !i.purchase_id; }).length;
-    h += '<button class="btn primary block" data-action="book-checked"' + (n ? '' : ' disabled') + ' style="margin-top:6px">Abgehakte in den Vorrat buchen' + (n ? ' (' + n + ')' : '') + '</button>';
-    h += '<p class="small muted" style="margin:10px 4px">Abhaken allein ändert den Vorrat nicht. Gebucht wird erst über diesen Knopf oder später über den Kassenbon, nie doppelt.</p>';
+    if (n) h += '<button class="btn primary block sticky-cta" data-action="book-checked">' + n + ' abgehakte Artikel einräumen</button>';
+    h += '<p class="small muted" style="margin:14px 6px">Abhaken ändert den Vorrat noch nicht. Eingeräumt wird erst mit dem Knopf oder später über den Kassenbon, und nie doppelt.</p>';
     return h;
   }
 
@@ -273,8 +303,8 @@
   function viewOffers() {
     var ph = T().PriceHistory.slice().sort(function (a, b) { return a.date < b.date ? 1 : -1; }).slice(0, 20);
     var h = '<div class="card"><h3>Keine geprüften Angebote</h3><p class="muted small" style="margin:6px 0 0">Angebote erscheinen hier nur mit echter Quelle und Datum. Es gibt keine Schätzungen und keine erfundenen Rabatte. Eine verlässliche Angebotsquelle ist noch nicht angebunden.</p></div>';
-    h += '<h2>Eigene Preise (historisch)</h2>';
-    h += ph.length ? '<div class="list">' + ph.map(function (p) {
+    h += '<div class="sec">Eigene Preise (historisch)</div>';
+    h += ph.length ? '<div class="panel">' + ph.map(function (p) {
       var pr = product(p.product_id);
       return '<div class="row"><div class="grow"><div class="title">' + esc(pr ? pr.name : p.product_id) + '</div><div class="sub">' + esc(p.market) + ' · ' + esc(dShort(p.date)) + ' · historischer Preis</div></div><div class="qty">' + fmtNum(p.unit_price) + ' €</div></div>';
     }).join('') + '</div>' : '<div class="card muted small">Noch keine Kassenbons erfasst. Sobald Bons gebucht sind, siehst du hier deine bezahlten Preise. Sie sind als historisch gekennzeichnet und gelten nicht als aktuelle Angebote.</div>';
@@ -282,36 +312,70 @@
   }
 
   // ---- Vorrat
+  var CAT_CLASS = { 'Obst & Gemüse': 'c-obst', 'Brot & Backwaren': 'c-brot', 'Kühlregal': 'c-kuehl', 'Tiefkühl': 'c-tk', 'Vorrat': 'c-vorrat', 'Haushalt': 'c-haus' };
+  function jarLevel(pid, total) {
+    var p = product(pid);
+    var min = T().MinStock.filter(function (m) { return m.product_id === pid; })[0];
+    var ref = min ? Number(min.min_qty_base) * 1.5 : (pkgContent(p) || (p.base_unit === 'Stk' ? 6 : p.base_unit === 'g' ? 500 : 1000));
+    return Math.max(0.08, Math.min(1, total / ref));
+  }
+  function jarHtml(pid, lots) {
+    var p = product(pid);
+    var total = lots.reduce(function (s, l) { return s + Number(l.qty_base); }, 0);
+    var first = lots.filter(function (l) { return l.best_before; }).sort(function (a, b) { return a.best_before < b.best_before ? -1 : 1; })[0];
+    var d = first ? daysUntil(first.best_before) : 99;
+    var flag = d < 0 ? 'bad' : d <= 3 ? 'warn' : '';
+    var opened = lots.some(function (l) { return l.opened_at; });
+    var lvl = Math.round(jarLevel(pid, total) * 100);
+    return '<button class="jar' + (opened ? ' opened' : '') + '" data-action="product" data-id="' + pid + '" aria-label="' + esc(p.name) + ', ' + esc(fmtQty(pid, total, false)) + (flag ? ', MHD bald' : '') + (opened ? ', angebrochen' : '') + '">' +
+      '<span class="lid">' + (flag ? '<i class="' + flag + '"></i>' : '') + '</span><span class="body"><span class="fill ' + (CAT_CLASS[p.category] || 'c-sonst') + '" style="height:' + lvl + '%"></span><span class="label">' + esc(fmtQty(pid, total, false)) + '</span></span>' +
+      '<span class="name">' + esc(p.name) + '</span></button>';
+  }
   function viewPantry() {
     var locs = T().Location.slice().sort(function (a, b) { return a.sort - b.sort; });
-    var h = '<div class="chips"><button class="chip' + (state.loc === 'all' ? ' on' : '') + '" data-action="loc" data-id="all">Alle</button>' +
-      locs.map(function (l) { return '<button class="chip' + (state.loc === l.location_id ? ' on' : '') + '" data-action="loc" data-id="' + l.location_id + '">' + esc(l.name) + '</button>'; }).join('') + '</div>';
-    var locFilter = state.loc === 'all' ? null : state.loc;
-    var byProduct = {};
-    T().StockLot.forEach(function (l) {
-      if (Number(l.qty_base) <= 1e-9 || (locFilter && l.location_id !== locFilter)) return;
-      (byProduct[l.product_id] = byProduct[l.product_id] || []).push(l);
-    });
-    var pids = Object.keys(byProduct).sort(function (a, b) { return product(a).name.localeCompare(product(b).name); });
-    h += '<div class="btn-row" style="margin-bottom:12px"><button class="btn" data-action="inventory">Inventur' + (locFilter ? ' ' + esc(locName(locFilter)) : '…') + '</button><button class="btn" data-action="new-product">+ Produkt</button></div>';
-    if (!pids.length) h += '<div class="card"><div class="empty">Hier ist nichts eingelagert.</div></div>';
-    else h += '<div class="list">' + pids.map(function (pid) {
-      var lots = EP.fefoSort(byProduct[pid]);
-      var total = lots.reduce(function (s, l) { return s + Number(l.qty_base); }, 0);
-      var first = lots.filter(function (l) { return l.best_before; })[0];
-      var opened = lots.filter(function (l) { return l.opened_at; })[0];
-      var d = first ? daysUntil(first.best_before) : 99;
-      var dot = d < 0 ? 'bad' : d <= 3 ? 'warn' : 'ok';
-      var sub = [];
-      if (!locFilter) sub.push(Array.from(new Set(lots.map(function (l) { return locName(l.location_id); }))).join(', '));
-      if (lots.length > 1) sub.push(lots.length + ' Chargen');
-      if (opened) sub.push('angebrochen seit ' + dNum(opened.opened_at));
-      return '<div class="row tap" data-action="product" data-id="' + pid + '"><span class="dot ' + dot + '"></span><div class="grow"><div class="title">' + esc(product(pid).name) + '</div><div class="sub">' + esc(sub.join(' · ')) + '</div></div>' +
-        '<div style="text-align:right"><div class="qty">' + esc(fmtQty(pid, total)) + '</div>' + (first ? '<div style="margin-top:3px">' + mhdPill(first.best_before) + '</div>' : '') + '</div></div>';
-    }).join('') + '</div>';
+    var view = state.pantryView || 'shelf';
+    var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;gap:10px"><div class="view-toggle" role="tablist"><button class="' + (view === 'shelf' ? 'on' : '') + '" data-action="pview" data-v="shelf">Regal</button><button class="' + (view === 'list' ? 'on' : '') + '" data-action="pview" data-v="list">Liste</button></div>' +
+      '<button class="link" data-action="new-product">Produkt anlegen</button></div>';
+    var byLoc = {};
+    T().StockLot.forEach(function (l) { if (Number(l.qty_base) > 1e-9) { var m = (byLoc[l.location_id] = byLoc[l.location_id] || {}); (m[l.product_id] = m[l.product_id] || []).push(l); } });
+    if (view === 'shelf') {
+      h += '<div class="legend"><span><span class="dot warn"></span>MHD bald</span><span><span class="dot bad"></span>abgelaufen</span><span>Deckel schief: angebrochen</span></div>';
+      locs.forEach(function (loc) {
+        var m = byLoc[loc.location_id] || {};
+        var pids = Object.keys(m).sort(function (a, b) { return product(a).name.localeCompare(product(b).name); });
+        h += '<section class="shelf' + (/tief|frost|kühltruhe/i.test(loc.name) ? ' frost' : '') + '"><div class="shelf-head"><b>' + esc(loc.name) + '</b><span><span class="count">' + pids.length + ' Produkte</span> <button class="inv" data-action="inventory" data-loc="' + loc.location_id + '">Inventur</button></span></div>';
+        if (!pids.length) h += '<div class="small muted" style="margin:0 10px 8px">Leer.</div><div class="board"></div></section>';
+        else {
+          // Bretter: je 4 Gläser eine Reihe (iPhone-Breite)
+          var perRow = 4, rows = [];
+          for (var i = 0; i < pids.length; i += perRow) rows.push(pids.slice(i, i + perRow));
+          h += rows.map(function (r) { return '<div class="jars">' + r.map(function (pid) { return jarHtml(pid, m[pid]); }).join('') + '</div><div class="board" style="margin-bottom:18px"></div>'; }).join('') + '</section>';
+        }
+      });
+    } else {
+      h += '<div class="chips"><button class="chip' + (state.loc === 'all' ? ' on' : '') + '" data-action="loc" data-id="all">Alle</button>' +
+        locs.map(function (l) { return '<button class="chip' + (state.loc === l.location_id ? ' on' : '') + '" data-action="loc" data-id="' + l.location_id + '">' + esc(l.name) + '</button>'; }).join('') + '</div>';
+      var locFilter = state.loc === 'all' ? null : state.loc;
+      var byProduct = {};
+      T().StockLot.forEach(function (l) { if (Number(l.qty_base) <= 1e-9 || (locFilter && l.location_id !== locFilter)) return; (byProduct[l.product_id] = byProduct[l.product_id] || []).push(l); });
+      var pids = Object.keys(byProduct).sort(function (a, b) { return product(a).name.localeCompare(product(b).name); });
+      if (!pids.length) h += '<div class="panel"><div class="empty">Hier ist nichts eingelagert.</div></div>';
+      else h += '<div class="panel">' + pids.map(function (pid) {
+        var lots = EP.fefoSort(byProduct[pid]);
+        var total = lots.reduce(function (s, l) { return s + Number(l.qty_base); }, 0);
+        var first = lots.filter(function (l) { return l.best_before; })[0];
+        var opened = lots.filter(function (l) { return l.opened_at; })[0];
+        var sub = [];
+        if (!locFilter) sub.push(Array.from(new Set(lots.map(function (l) { return locName(l.location_id); }))).join(', '));
+        if (lots.length > 1) sub.push(lots.length + ' Chargen');
+        if (opened) sub.push('offen seit ' + dNum(opened.opened_at));
+        return '<div class="row indent tap" data-action="product" data-id="' + pid + '">' + Illus.dept(product(pid).category) + '<div class="grow"><div class="title">' + esc(product(pid).name) + '</div><div class="sub">' + esc(sub.join(', ')) + '</div></div>' +
+          '<div style="text-align:right"><div class="qty">' + esc(fmtQty(pid, total)) + '</div>' + (first ? '<div style="margin-top:4px">' + mhdPill(first.best_before) + '</div>' : '') + '</div></div>';
+      }).join('') + '</div>';
+    }
     var low = T().MinStock.filter(function (m) { return EP.totalStock(store, m.product_id, m.location_id || null) < Number(m.min_qty_base) - 1e-9; });
-    if (low.length) h += '<h2>Unter Mindestbestand</h2><div class="list">' + low.map(function (m) {
-      return '<div class="row tap" data-action="product" data-id="' + m.product_id + '"><span class="dot bad"></span><div class="grow"><div class="title">' + esc(product(m.product_id).name) + '</div><div class="sub">Mindestens ' + esc(fmtQty(m.product_id, Number(m.min_qty_base))) + '</div></div><div class="qty">' + esc(fmtQty(m.product_id, EP.totalStock(store, m.product_id, m.location_id || null))) + '</div></div>';
+    if (low.length) h += '<div class="sec">Unter Mindestbestand</div><div class="panel">' + low.map(function (m) {
+      return '<div class="row indent tap" data-action="product" data-id="' + m.product_id + '">' + Illus.dept(product(m.product_id).category) + '<div class="grow"><div class="title">' + esc(product(m.product_id).name) + '</div><div class="sub">Mindestens ' + esc(fmtQty(m.product_id, Number(m.min_qty_base), false)) + '</div></div><div class="qty">' + esc(fmtQty(m.product_id, EP.totalStock(store, m.product_id, m.location_id || null), false)) + '</div></div>';
     }).join('') + '</div>';
     return h;
   }
@@ -320,26 +384,26 @@
   function viewSettings() {
     var check = EP.verifyLedger(store);
     var h = '<div class="note">Demo-Modus: Beispieldaten nur auf diesem Gerät. Deine echten Bestände und die ChatGPT-Version werden nicht berührt.</div>';
-    h += '<h2>Produkte & Packungsregeln</h2><div class="list">' + T().Product.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (p) {
+    h += '<div class="sec">Produkte & Packungsregeln</div><div class="panel">' + T().Product.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (p) {
       var k = pkgOf(p);
       return '<div class="row tap" data-action="edit-product" data-id="' + p.product_id + '"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">' + esc(p.category) + ' · Basiseinheit ' + esc(p.base_unit) + '</div></div><div class="small ' + (k ? '' : 'muted') + '">' + (k ? esc(k.label) : 'keine Packung') + '</div></div>';
     }).join('') + '</div>';
     var aliases = T().ProductAlias;
-    h += '<h2>Produktzuordnungen <button class="link" data-action="new-alias">+ Regel</button></h2>';
-    h += aliases.length ? '<div class="list">' + aliases.map(function (a) {
+    h += '<div class="sec">Produktzuordnungen <button class="link" data-action="new-alias">+ Regel</button></div>';
+    h += aliases.length ? '<div class="panel">' + aliases.map(function (a) {
       return '<div class="row"><div class="grow"><div class="title">„' + esc(a.alias_original) + '“ → ' + esc((product(a.product_id) || {}).name) + '</div><div class="sub">' + esc(a.status) + ' · Quelle ' + esc(a.source) + '</div></div></div>';
     }).join('') + '</div>' : '<div class="card small muted">Noch keine Regeln.</div>';
-    h += '<h2>Lagerorte <button class="link" data-action="new-location">+ Ort</button></h2><div class="list">' + T().Location.map(function (l) {
+    h += '<div class="sec">Lagerorte <button class="link" data-action="new-location">+ Ort</button></div><div class="panel">' + T().Location.map(function (l) {
       return '<div class="row"><div class="grow"><div class="title">' + esc(l.name) + '</div></div><span class="muted small">' + esc(l.location_id) + '</span></div>';
     }).join('') + '</div>';
-    h += '<h2>Daten & Nachvollziehbarkeit</h2><div class="list">' +
-      '<div class="row"><div class="grow"><div class="title">Bestand = Summe aller Buchungen</div><div class="sub">' + T().StockEvent.length + ' Buchungen im Journal</div></div>' + (check.ok ? '<span class="pill ok">geprüft ✓</span>' : '<span class="pill bad">' + check.problems.length + ' Abweichung(en)</span>') + '</div>' +
+    h += '<div class="sec">Daten & Nachvollziehbarkeit</div><div class="panel">' +
+      '<div class="row"><div class="grow"><div class="title">Bestand = Summe aller Buchungen</div><div class="sub">' + T().StockEvent.length + ' Buchungen im Journal</div></div>' + (check.ok ? '<span class="tag ok">geprüft ✓</span>' : '<span class="tag bad">' + check.problems.length + ' Abweichung(en)</span>') + '</div>' +
       '<div class="row tap" data-action="journal"><div class="grow"><div class="title">Buchungsjournal ansehen</div></div><span class="muted">›</span></div>' +
       '<div class="row tap" data-action="export"><div class="grow"><div class="title">Daten exportieren (JSON)</div></div><span class="muted">›</span></div>' +
       '<div class="row tap" data-action="reset"><div class="grow"><div class="title" style="color:var(--bad)">Beispieldaten zurücksetzen</div></div></div></div>';
-    h += '<h2>Familienzugang</h2><div class="card small">Kommt mit der Online-Datenbasis: Anmeldung mit Google, Zugangsanfrage per E-Mail an den Besitzer, Zugriff erst nach deiner Freigabe.</div>';
-    h += '<h2>Sprache</h2><div class="card small">' + (speechSupported() ? 'Spracheingabe über die Spracherkennung des Browsers ist verfügbar.' : 'Dieser Browser bietet keine direkte Spracherkennung. Nutze das Mikrofon der Tastatur (Diktat), das funktioniert genauso.') + ' Verstandener Text wird regelbasiert ausgewertet. Es fallen keine KI-Kosten an.</div>';
-    h += '<p class="small muted" style="margin:16px 4px">Einkaufsplaner · Claude-Variante · Demo-Version 0.1</p>';
+    h += '<div class="sec">Familienzugang</div><div class="card small">Kommt mit der Online-Datenbasis: Anmeldung mit Google, Zugangsanfrage per E-Mail an den Besitzer, Zugriff erst nach deiner Freigabe.</div>';
+    h += '<div class="sec">Sprache</div><div class="card small">' + (speechSupported() ? 'Spracheingabe über die Spracherkennung des Browsers ist verfügbar.' : 'Dieser Browser bietet keine direkte Spracherkennung. Nutze das Mikrofon der Tastatur (Diktat), das funktioniert genauso.') + ' Verstandener Text wird regelbasiert ausgewertet. Es fallen keine KI-Kosten an.</div>';
+    h += '<p class="small muted" style="margin:16px 4px">Tischlein, Demo-Version 0.2 (Claude-Variante des Familien-Einkaufsplaners)</p>';
     return h;
   }
 
@@ -351,7 +415,7 @@
     if (recognition) { try { recognition.stop(); } catch (e) {} recognition = null; }
     sheet = null; $('sheet').classList.remove('open'); $('backdrop').classList.remove('open'); render();
   }
-  function head(title) { return '<div class="grab"></div><div class="sheet-head"><h3 id="sheetTitle">' + title + '</h3><button class="icon-btn" data-action="close-sheet" aria-label="Schließen"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>'; }
+  function head(title) { return '<div class="grab"></div><div class="sheet-head"><h3 id="sheetTitle">' + title + '</h3><button class="x" data-action="close-sheet" aria-label="Schließen"><svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></svg></button></div>'; }
   function renderSheet() { if (!sheet) return; $('sheet').innerHTML = SHEETS[sheet.type](); }
   function locOptions(sel, allowEmpty) {
     return (allowEmpty ? '<option value="">Ort wählen…</option>' : '') + T().Location.map(function (l) { return '<option value="' + l.location_id + '"' + (l.location_id === sel ? ' selected' : '') + '>' + esc(l.name) + '</option>'; }).join('');
@@ -366,18 +430,19 @@
     cook: function () {
       var r = recipe(sheet.recipe_id);
       if (sheet.result) {
-        return head('Gebucht ✓') + '<div class="list">' + sheet.result.lines.map(function (l) {
+        return head('Gebucht ✓') + '<div class="panel">' + sheet.result.lines.map(function (l) {
           var p = l.product_id ? product(l.product_id) : null;
           var right = l.status === 'ok' ? '<span class="qty">−' + esc(fmtQty(l.product_id, l.booked, false)) + '</span>' :
-            l.status === 'teilweise' ? '<span class="pill warn">−' + esc(fmtQty(l.product_id, l.booked, false)) + ', fehlte ' + esc(fmtQty(l.product_id, l.missing, false)) + '</span>' :
-            '<span class="pill unclear">nicht gebucht</span>';
+            l.status === 'teilweise' ? '<span class="tag warn">−' + esc(fmtQty(l.product_id, l.booked, false)) + ', fehlte ' + esc(fmtQty(l.product_id, l.missing, false)) + '</span>' :
+            '<span class="tag unclear">nicht gebucht</span>';
           return '<div class="row"><div class="grow"><div class="title">' + esc(p ? p.name : l.text) + '</div>' + (l.reason ? '<div class="sub">' + esc(l.reason) + '</div>' : '') + '</div>' + right + '</div>';
         }).join('') + '</div><p class="small muted">Vorgang ' + esc(sheet.result.cook_id) + ' · ' + sheet.result.events.length + ' Buchungen im Journal</p><button class="btn primary block" data-action="close-sheet">Fertig</button>';
       }
       var pv = EP.previewCook(store, sheet.recipe_id, sheet.persons, sheet.overrides);
       var h = head(esc(r.name) + ' gekocht?');
+      h += '<div class="sheet-hero">' + Illus.dish(r) + '<div class="muted">Prüf kurz die Mengen. Abgebucht wird erst mit dem Knopf unten.</div></div>';
       h += '<div class="row" style="padding:0 2px 12px;border:0"><div class="grow muted">Personen</div><div class="stepper"><button data-action="cook-persons" data-d="-1">−</button><span>' + sheet.persons + '</span><button data-action="cook-persons" data-d="1">+</button></div></div>';
-      h += '<div class="list">' + pv.lines.map(function (l) {
+      h += '<div class="panel">' + pv.lines.map(function (l) {
         if (l.status === 'unklar') return '<div class="row"><span class="dot unclear"></span><div class="grow"><div class="title">' + esc(l.text) + '</div><div class="sub">' + esc(l.reason) + ' · wird nicht abgebucht</div></div></div>';
         if (l.status === 'übersprungen') return '<div class="row"><span class="dot"></span><div class="grow"><div class="title muted">' + esc(l.text) + '</div><div class="sub">nicht verwendet</div></div><button class="mini" data-action="cook-skip" data-line="' + l.line_no + '">Doch</button></div>';
         var p = product(l.product_id);
@@ -386,7 +451,7 @@
           '<button class="mini" data-action="cook-skip" data-line="' + l.line_no + '" aria-label="nicht verwendet">✕</button></div>';
       }).join('') + '</div>';
       h += '<p class="small muted">Mengen sind änderbar, falls du tatsächlich mehr oder weniger verwendet hast. Abgezogen wird zuerst die Ware mit dem frühesten MHD, angebrochene Packungen zuerst.</p>';
-      h += '<button class="btn primary block" data-action="cook-confirm">Abbuchen</button>';
+      h += '<button class="btn primary block" data-action="cook-confirm">Zutaten abbuchen</button>';
       return h;
     },
 
@@ -394,17 +459,17 @@
       var r = recipe(sheet.id), p = sheet.persons;
       var ings = T().RecipeIngredient.filter(function (i) { return i.recipe_id === r.recipe_id; }).sort(function (a, b) { return a.line_no - b.line_no; });
       var h = head(esc(r.name));
-      h += '<div class="meta" style="margin-bottom:12px"><span>' + esc(r.minutes) + ' Min.</span><span>Grundrezept für ' + esc(r.servings_base) + '</span>' + (r.source_url ? '<a href="' + esc(r.source_url) + '" target="_blank" rel="noopener">Quelle</a>' : '') + '</div>';
+      h += '<div class="sheet-hero">' + Illus.dish(r) + '<div class="muted">' + esc(r.minutes) + ' Minuten<br>Grundrezept für ' + esc(r.servings_base) + (r.source_url ? '<br><a href="' + esc(r.source_url) + '" target="_blank" rel="noopener">Quelle öffnen</a>' : '') + '</div></div>';
       h += '<div class="row" style="padding:0 2px 12px;border:0"><div class="grow muted">Personen</div><div class="stepper"><button data-action="recipe-persons" data-d="-1">−</button><span>' + p + '</span><button data-action="recipe-persons" data-d="1">+</button></div></div>';
-      h += '<div class="list">' + ings.map(function (i) {
+      h += '<div class="panel">' + ings.map(function (i) {
         var q = i.qty === '' || i.qty == null ? null : Number(i.qty) * (i.per === 'Person' ? p : p / Number(r.servings_base || 2));
         var stock = i.product_id ? EP.totalStock(store, i.product_id) : null;
         var dot = !i.product_id ? 'unclear' : stock > 0 ? 'ok' : 'bad';
-        return '<div class="row"><span class="dot ' + dot + '"></span><div class="grow"><div class="title">' + esc(i.text_original) + '</div><div class="sub">' + (i.product_id ? 'Vorrat ' + esc(fmtQty(i.product_id, stock, false)) : 'keinem Produkt zugeordnet') + (i.per === 'Person' ? ' · pro Person' : '') + '</div></div><div class="qty">' + (q == null ? '<span class="pill unclear">ohne Menge</span>' : esc(fmtNum(q) + ' ' + (i.unit || ''))) + '</div></div>';
+        return '<div class="row"><span class="dot ' + dot + '"></span><div class="grow"><div class="title">' + esc(i.text_original) + '</div><div class="sub">' + (i.product_id ? 'Vorrat ' + esc(fmtQty(i.product_id, stock, false)) : 'keinem Produkt zugeordnet') + (i.per === 'Person' ? ' · pro Person' : '') + '</div></div><div class="qty">' + (q == null ? '<span class="tag unclear">ohne Menge</span>' : esc(fmtNum(q) + ' ' + (i.unit || ''))) + '</div></div>';
       }).join('') + '</div>';
-      if (r.steps) h += '<h2>Zubereitung</h2><div class="card"><ol class="steps">' + r.steps.split('\n').filter(Boolean).map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ol></div>';
+      if (r.steps) h += '<div class="sec">Zubereitung</div><div class="card"><ol class="steps">' + r.steps.split('\n').filter(Boolean).map(function (s) { return '<li>' + esc(s) + '</li>'; }).join('') + '</ol></div>';
       h += '<div class="btn-row" style="margin-bottom:10px"><button class="btn" data-action="fav" data-id="' + r.recipe_id + '">' + (r.favorite ? '★ Favorit' : '☆ Favorit') + '</button><button class="btn" data-action="dislike" data-id="' + r.recipe_id + '">' + (r.disliked ? 'Wieder erlaubt' : 'Unerwünscht') + '</button></div>';
-      h += '<button class="btn primary block" data-action="cook" data-id="' + r.recipe_id + '" data-persons="' + p + '">Gekocht…</button>';
+      h += '<button class="btn primary block" data-action="cook" data-id="' + r.recipe_id + '" data-persons="' + p + '">Gekocht</button>';
       return h;
     },
 
@@ -418,7 +483,7 @@
       h += '<div class="field"><label>Rezeptlink (optional)</label><input type="text" inputmode="url" data-draft="url" value="' + esc(d.url) + '" placeholder="https://…"></div>';
       if (d.url) h += '<div class="note">Automatischer Import von Links kommt mit dem Server-Teil. Der Link wird als Quelle gespeichert.</div>';
       var parsed = parseIngredients(d.ingredients);
-      if (parsed.length) h += '<h2>Prüfung</h2><div class="list">' + parsed.map(function (x) {
+      if (parsed.length) h += '<div class="sec">Prüfung</div><div class="panel">' + parsed.map(function (x) {
         return '<div class="row"><span class="dot ' + (x.product_id && x.qty != null ? 'ok' : 'unclear') + '"></span><div class="grow"><div class="title">' + esc(x.text) + '</div><div class="sub">' + (x.product_id ? '→ ' + esc(product(x.product_id).name) : x.suggest ? 'Meinst du ' + esc(x.suggest) + '? Ohne Bestätigung keine Zuordnung' : 'kein Produkt, wird nicht abgebucht') + (x.qty == null ? ' · ohne Menge' : '') + '</div></div><div class="qty">' + (x.qty != null ? esc(fmtNum(x.qty) + ' ' + x.unit) : '') + (x.per === 'Person' ? '<div class="small muted">pro Person</div>' : '') + '</div></div>';
       }).join('') + '</div>';
       h += '<button class="btn primary block" data-action="save-recipe"' + (d.name.trim() ? '' : ' disabled') + '>Rezept speichern</button>';
@@ -432,30 +497,30 @@
       var k = pkgOf(p);
       var h = head(esc(p.name));
       h += '<div class="meta" style="margin-bottom:12px"><span class="qty" style="color:var(--ink)">' + esc(fmtQty(p.product_id, total)) + '</span><span>' + (k ? 'Packung: ' + esc(k.label) : 'keine Packungsregel') + '</span></div>';
-      if (lots.length) h += '<div class="list">' + lots.map(function (l) {
+      if (lots.length) h += '<div class="panel">' + lots.map(function (l) {
         return '<div class="row"><div class="grow"><div class="title">' + esc(fmtQty(p.product_id, Number(l.qty_base))) + '</div><div class="sub">' + esc(locName(l.location_id)) + (l.opened_at ? ' · angebrochen ' + dNum(l.opened_at) : ' · ungeöffnet') + (l.condition ? ' · ' + esc(l.condition) : '') + '</div></div>' + mhdPill(l.best_before) +
           (l.opened_at ? '' : '<button class="mini" data-action="open-lot" data-id="' + l.lot_id + '">Öffnen</button>') + '</div>';
       }).join('') + '</div>';
       var f = sheet.form;
-      h += '<h2>Buchen</h2><div class="seg" style="margin-bottom:10px">' + [['add', 'Dazu'], ['set', 'Insgesamt'], ['remove', 'Entnehmen']].map(function (x) { return '<button class="' + (f.intent === x[0] ? 'on' : '') + '" data-action="pform-intent" data-v="' + x[0] + '">' + x[1] + '</button>'; }).join('') + '</div>';
+      h += '<div class="sec">Buchen</div><div class="seg" style="margin-bottom:10px">' + [['add', 'Dazu'], ['set', 'Insgesamt'], ['remove', 'Entnehmen']].map(function (x) { return '<button class="' + (f.intent === x[0] ? 'on' : '') + '" data-action="pform-intent" data-v="' + x[0] + '">' + x[1] + '</button>'; }).join('') + '</div>';
       h += '<div class="grid3"><div class="field"><label>Menge</label><input type="number" inputmode="decimal" step="any" min="0" data-pform="qty" value="' + esc(f.qty) + '"></div><div class="field"><label>Einheit</label><select data-pform="unit">' + unitOptions(p, f.unit) + '</select></div><div class="field"><label>Ort</label><select data-pform="loc">' + locOptions(f.loc, true) + '</select></div></div>';
       if (f.intent === 'add') h += '<div class="field"><label>MHD (optional)</label><input type="date" data-pform="bb" value="' + esc(f.bb) + '"></div>';
       h += '<div class="btn-row"><button class="btn danger" data-action="used-up">Aufgebraucht</button><button class="btn primary" data-action="pform-book">Buchen</button></div>';
       var ev = T().StockEvent.filter(function (e) { return e.product_id === p.product_id; }).slice(-15).reverse();
-      h += '<h2>Verlauf</h2>' + (ev.length ? '<div class="list">' + ev.map(function (e) {
+      h += '<div class="sec">Verlauf</div>' + (ev.length ? '<div class="panel">' + ev.map(function (e) {
         var dlt = Number(e.delta_base);
         return '<div class="row"><div class="grow"><div class="title">' + esc(EVENT_LABEL[e.type] || e.type) + '</div><div class="sub">' + esc(dShort(String(e.ts).slice(0, 10))) + ' ' + esc(String(e.ts).slice(11, 16)) + ' · ' + esc(locName(e.location_id)) + (e.note ? ' · ' + esc(e.note) : '') + '</div></div><div class="qty" style="color:' + (dlt < 0 ? 'var(--bad)' : dlt > 0 ? 'var(--ok)' : 'var(--muted)') + '">' + (dlt > 0 ? '+' : dlt < 0 ? '−' : '±') + esc(fmtQty(p.product_id, Math.abs(dlt), false)) + '</div></div>';
       }).join('') + '</div>' : '<div class="card small muted">Noch keine Buchungen.</div>');
       return h;
     },
 
-    inventory: function () {
+    inventory: function (el) {
       var loc = sheet.loc;
       var h = head('Inventur');
       h += '<div class="field"><label>Lagerort</label><select data-change="inv-loc">' + locOptions(loc, true) + '</select></div>';
       if (!loc) return h + '<p class="muted">Wähle den Ort, den du gerade zählst. Andere Orte bleiben unverändert.</p>';
       h += '<div class="note info">Trage ein, was jetzt tatsächlich im ' + esc(locName(loc)) + ' ist. Nicht aufgeführte Produkte werden hier auf 0 gesetzt. Andere Lagerorte bleiben unverändert.</div>';
-      h += '<div class="list">' + sheet.rows.map(function (r, idx) {
+      h += '<div class="panel">' + sheet.rows.map(function (r, idx) {
         var p = product(r.product_id);
         return '<div class="row"><div class="grow"><div class="title">' + esc(p.name) + '</div><div class="sub">bisher ' + esc(fmtQty(p.product_id, r.before, false)) + '</div></div><input type="number" inputmode="decimal" step="any" min="0" style="width:90px" value="' + esc(r.qty) + '" data-change="inv-qty" data-idx="' + idx + '"><span class="small muted" style="width:26px">' + esc(p.base_unit) + '</span></div>';
       }).join('') + '</div>';
@@ -474,7 +539,7 @@
       h += '<button class="btn block" data-action="voice-parse">Verstehen</button>';
       if (sheet.actions) {
         if (!sheet.actions.length) return h + '<div class="card muted" style="margin-top:12px">Ich habe kein Produkt erkannt. Formuliere es bitte etwas anders.</div>';
-        h += '<h2>Erkannt: ' + sheet.actions.length + ' Aktion(en)</h2>';
+        h += '<div class="sec">Erkannt: ' + sheet.actions.length + ' Aktion(en)</div>';
         h += sheet.actions.map(function (a, i) { return sheet.listMode ? listActionCard(a, i) : actionCard(a, i); }).join('');
         var ok = sheet.actions.every(function (a) { return actionValid(a); });
         h += '<button class="btn primary block" data-action="voice-book"' + (ok ? '' : ' disabled') + '>' + (sheet.listMode ? 'Hinzufügen' : 'Alles buchen') + '</button>';
@@ -546,7 +611,7 @@
 
     journal: function () {
       var ev = T().StockEvent.slice(-60).reverse();
-      return head('Buchungsjournal') + '<p class="small muted">Jede Bestandsänderung ist eine unveränderliche Buchung. Korrekturen werden als Gegenbuchung erfasst.</p><div class="list">' + ev.map(function (e) {
+      return head('Buchungsjournal') + '<p class="small muted">Jede Bestandsänderung ist eine unveränderliche Buchung. Korrekturen werden als Gegenbuchung erfasst.</p><div class="panel">' + ev.map(function (e) {
         var p = product(e.product_id);
         return '<div class="row"><div class="grow"><div class="title">' + esc(p ? p.name : e.product_id) + ' · ' + esc(EVENT_LABEL[e.type] || e.type) + '</div><div class="sub">' + esc(String(e.ts).replace('T', ' ').slice(0, 16)) + ' · ' + esc(locName(e.location_id)) + ' · ' + esc(e.tx_id) + (e.note ? ' · ' + esc(e.note) : '') + '</div></div><div class="qty">' + (Number(e.delta_base) > 0 ? '+' : '') + esc(fmtNum(Number(e.delta_base))) + '</div></div>';
       }).join('') + '</div>';
@@ -762,6 +827,7 @@
     },
 
     loc: function (el) { state.loc = el.getAttribute('data-id'); render(); },
+    pview: function (el) { state.pantryView = el.getAttribute('data-v'); render(); },
     product: function (el) { var pid = el.getAttribute('data-id'); openSheet({ type: 'product', id: pid, key: uuid(), form: { intent: 'add', qty: '', unit: defaultUnit(pid), loc: state.loc !== 'all' ? state.loc : lastLocation(pid), bb: '' } }); },
     'pform-intent': function (el) { sheet.form.intent = el.getAttribute('data-v'); renderSheet(); },
     'pform-book': function (el) {
@@ -782,8 +848,8 @@
       if (r) { toast('Als aufgebraucht gebucht'); sheet.key = uuid(); } renderSheet();
     },
     'open-lot': function (el) { var r = run({ type: 'open', lot_id: el.getAttribute('data-id') }, uuid()); if (r) toast('Als geöffnet markiert'); renderSheet(); },
-    inventory: function () {
-      var loc = state.loc !== 'all' ? state.loc : '';
+    inventory: function (el) {
+      var loc = el && el.getAttribute('data-loc') ? el.getAttribute('data-loc') : state.loc !== 'all' ? state.loc : '';
       openSheet({ type: 'inventory', loc: loc, rows: loc ? inventoryRows(loc) : [], key: uuid() });
     },
     'inv-save': function (el) {
@@ -875,6 +941,7 @@
   });
 
   load();
+  renderChrome();
   render();
   window.__EP_APP = { store: function () { return store; }, run: run, actions: ACTIONS };
 })();
