@@ -11,7 +11,8 @@ var Net = (function () {
 
   function conf() {
     var c = read(CONN_KEY, {}), d = window.TISCH_CONFIG || {};
-    return { backendUrl: c.backendUrl || d.backendUrl || '', clientId: c.clientId || d.googleClientId || '', env: c.env || d.env || 'TEST' };
+    // Auf dem Gerät gespeicherte Werte haben Vorrang – auch leere (= bewusst Demo-Modus).
+    return { backendUrl: 'backendUrl' in c ? c.backendUrl : d.backendUrl || '', clientId: 'clientId' in c ? c.clientId : d.googleClientId || '', env: c.env || d.env || 'TEST' };
   }
   function setConf(patch) { var c = read(CONN_KEY, {}); Object.keys(patch).forEach(function (k) { c[k] = patch[k]; }); write(CONN_KEY, c); }
   function live() { var c = conf(); return !!(c.backendUrl && c.clientId); }

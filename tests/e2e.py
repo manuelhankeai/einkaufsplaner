@@ -245,6 +245,7 @@ def main():
 
             # ---------------- Demo-Modus (ohne Backend): alle umgebauten Aktionen
             dctx = b.new_context(viewport={'width': 390, 'height': 844})
+            dctx.add_init_script("localStorage.setItem('tisch-conn', JSON.stringify({ backendUrl: '', clientId: '' }))")
             demo = dctx.new_page()
             demo.on('pageerror', lambda e: errors.append(f'Demo: {e}'))
             demo.on('dialog', lambda d: d.accept())
