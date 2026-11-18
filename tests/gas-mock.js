@@ -79,6 +79,7 @@ function create(opts) {
   const spreadsheets = {}, opened = [], mails = [], fetches = [], logs = [];
   const props = new Map([['GOOGLE_CLIENT_ID', CLIENT]]);
   const cache = new Map();
+  const stats = { batchGet: 0, batchUpdate: 0 };
   let lockBusy = false, lockHeld = false, openaiHandler = opts.openai || null, clock = opts.clock || null;
 
   const ctx = {
@@ -126,11 +127,41 @@ function create(opts) {
           const r = openaiHandler(url, o);
           return resp(r.code || 200, r.body);
         }
+        if (opts.web) { const w = opts.web(url, o); if (w) return resp(w.code || 200, w.body); }
         throw new Error('Unerwartete Adresse ' + url);
       }
     }
   };
   function resp(code, body) { const t = typeof body === 'string' ? body : JSON.stringify(body); return { getResponseCode: () => code, getContentText: () => t }; }
+  if (opts.fast) {
+    // Erweiterter Dienst „Google Sheets API“: ein Aufruf zum Lesen, einer zum Schreiben (RAW = Text bleibt Text)
+    const bySheet = (id, name) => { const ss = spreadsheets[id]; if (!ss) throw new Error('Keine Berechtigung'); const sh = ss.sheets[name]; if (!sh) throw new Error('Unable to parse range: ' + name); return sh; };
+    const fmt = (v) => (Object.prototype.toString.call(v) === '[object Date]' ? String(v.getDate()).padStart(2, '0') + '.' + String(v.getMonth() + 1).padStart(2, '0') + '.' + v.getFullYear() : v);
+    ctx.Sheets = { Spreadsheets: { Values: {
+      batchGet(id, o) {
+        stats.batchGet++; opened.push(id);
+        return { valueRanges: o.ranges.map((r) => {
+          const [name, cell] = r.split('!'); const sh = bySheet(id, name);
+          if (cell) { const m = cell.match(/^([A-Z])(\d+)$/); const v = (sh.cells[Number(m[2]) - 1] || [])[m[1].charCodeAt(0) - 65]; return { range: r, values: v === undefined || v === '' ? undefined : [[fmt(v)]] }; }
+          const rows = sh.cells.map((row) => { const x = row.map(fmt); while (x.length && (x[x.length - 1] === '' || x[x.length - 1] === undefined)) x.pop(); return x; });
+          while (rows.length && !rows[rows.length - 1].length) rows.pop();
+          return { range: r, values: rows.length ? rows : undefined };
+        }) };
+      },
+      batchUpdate(res, id) {
+        stats.batchUpdate++; opened.push(id);
+        if (res.valueInputOption !== 'RAW') throw new Error('nur RAW erwartet');
+        res.data.forEach((d) => {
+          const m = d.range.match(/^(\w+)!([A-Z]+)(\d+):([A-Z]+)(\d+)$/); const sh = bySheet(id, m[1]);
+          const r0 = Number(m[3]); if (d.values.length !== Number(m[5]) - r0 + 1) throw new Error('Zeilenzahl passt nicht zum Bereich ' + d.range);
+          sh.stats.writes++;
+          d.values.forEach((row, i) => { while (sh.cells.length < r0 + i) sh.cells.push([]); row.forEach((v, j) => { sh.cells[r0 - 1 + i][j] = v; }); });
+          while (sh.cells.length && sh.cells[sh.cells.length - 1].every((v) => v === '' || v === undefined)) sh.cells.pop();
+        });
+        return {};
+      }
+    } } };
+  }
   vm.createContext(ctx);
   vm.runInContext(code, ctx, { filename: 'Code.gs' });
   if (clock) vm.runInContext('Date.now = ' + clock.toString(), ctx);
@@ -145,7 +176,7 @@ function create(opts) {
     return JSON.parse(out.content);
   }
   return {
-    ctx, post, spreadsheets, ids, opened, mails, fetches, logs, props, cache, SCHEMA, CLIENT, OWNER,
+    ctx, post, spreadsheets, ids, opened, stats, mails, fetches, logs, props, cache, SCHEMA, CLIENT, OWNER,
     setLockBusy(v) { lockBusy = v; },
     setOpenAI(fn) { openaiHandler = fn; },
     sheet(env, name) { return spreadsheets[ids[env]].sheets[name]; }

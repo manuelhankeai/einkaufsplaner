@@ -12,6 +12,8 @@ PORT = 8770
 BASE = f'http://127.0.0.1:{PORT}/'
 SHOTS = os.environ.get('E2E_SHOTS', '/tmp/e2e-shots')
 os.makedirs(SHOTS, exist_ok=True)
+for _f in os.listdir(SHOTS):
+    os.remove(os.path.join(SHOTS, _f))
 results = []
 
 
@@ -61,7 +63,12 @@ def wait_toast(page, text, timeout=8000):
 
 
 def idle(page):
-    page.wait_for_function('() => !document.querySelector("#busy.on")', timeout=10000)
+    page.wait_for_function('() => !document.querySelector("#busy.on") && !document.querySelector("#sync.on:not(.ok)")', timeout=20000)
+
+
+def saved(page):
+    """Wartet auf „gespeichert“ – erst nach Bestätigung des Servers."""
+    page.wait_for_selector('#sync.on.ok', timeout=20000)
 
 
 def total(page, pid):
@@ -137,8 +144,9 @@ def main():
                 if not loc:
                     wife.select_option('[data-pform="loc"]', 'KS')
                 wife.click('[data-action="pform-book"]')
-                wait_toast(wife, 'Gebucht')
-                idle(wife)
+                wife.wait_for_selector('#sync.on')                       # sofort sichtbar
+                assert round(before - total(wife, 'P-MAUL'), 3) == 2, 'Vorschau sofort im Vorrat'
+                saved(wife)
                 after = server_total('P-MAUL')
                 assert round(before - after, 3) == 2, (before, after)
                 assert ctl('stock')['ledger']['ok']
@@ -160,6 +168,7 @@ def main():
                 wife.wait_for_selector('[data-action="cook-confirm"]')
                 wife.screenshot(path=f'{SHOTS}/04-kochen.png')
                 wife.click('[data-action="cook-confirm"]')
+                saved(wife)
                 wife.wait_for_selector('text=Gebucht ✓')
                 wife.screenshot(path=f'{SHOTS}/05-gebucht.png')
                 s = ctl('stock')
@@ -174,7 +183,7 @@ def main():
                 if not el:
                     raise AssertionError('keine Position auf der Liste')
                 iid = el.get_attribute('data-item')
-                el.click(); idle(wife)
+                el.click(); saved(wife)
                 items = {i['item_id']: i for i in ctl('stock')['items']}
                 assert items.get(iid, {}).get('checked') is True, ('Position', iid, items.get(iid), 'gespeichert:', list(items.keys())[:8])
                 owner.evaluate('document.getElementById("toast").textContent = ""')
@@ -197,10 +206,42 @@ def main():
                     wife.select_option('[data-act="loc"]', 'KS')
                 wife.screenshot(path=f'{SHOTS}/06-sprache.png')
                 wife.click('[data-action="voice-book"]')
-                wait_toast(wife, 'gebucht')
-                idle(wife)
+                saved(wife)
                 assert round(server_total('P-GURKE') - before, 3) == 2
             step('Partnerin öffnet die App neu, nur mit Cookie wie nach „Zum Home-Bildschirm“ (bleibt angemeldet), und bucht per KI-Sprache „zwei Gurken gekauft“', session_and_ai)
+
+            def recipe_import():
+                ctl('ai')  # Import ohne KI: Rezeptdaten der Seite + Regeln
+                wife.click('[data-tab="cookbook"]')
+                wife.click('[data-action="import-recipe"]')
+                wife.fill('#impUrl', 'https://rezepte.example.org/gnocchi')
+                wife.click('[data-action="imp-load"]')
+                wife.wait_for_selector('text=Prüfen & speichern', timeout=20000)
+                assert wife.input_value('[data-impr="name"]') == 'Ofen-Gnocchi mit Tomaten & Feta'
+                assert wife.input_value('[data-impr="servings"]') == '4'
+                cards = wife.query_selector_all('.ing-card')
+                assert len(cards) == 7, len(cards)
+                maul = [c for c in cards if '4 Maultaschen' in c.inner_text()][0]
+                assert 'unclear' not in maul.get_attribute('class'), 'Maultaschen automatisch zugeordnet'
+                gn = [i for i, c in enumerate(cards) if 'Gnocchi' in c.inner_text()][0]
+                wife.select_option(f'[data-ing="pid"][data-idx="{gn}"]', '__new')
+                wife.wait_for_selector(f'[data-ing="newUnit"][data-idx="{gn}"]')
+                assert wife.eval_on_selector(f'[data-ing="newUnit"][data-idx="{gn}"]', 'e => e.value') == 'g', 'Einheit aus „800 g“ übernommen'
+                wife.screenshot(path=f'{SHOTS}/09-import.png', full_page=False)
+                wife.click('[data-action="imp-save"]')
+                saved(wife)
+                s = ctl('stock')
+                rec = [r for r in s['recipes'] if r['name'] == 'Ofen-Gnocchi mit Tomaten & Feta']
+                assert len(rec) == 1 and rec[0]['servings_base'] == 4 and rec[0]['image_url'].startswith('https://'), rec
+                ings = [i for i in s['ings'] if i['recipe_id'] == rec[0]['recipe_id']]
+                assert len(ings) == 7
+                gp = [p for p in s['products'] if p['name'] == 'Gnocchi']
+                assert len(gp) == 1 and gp[0]['base_unit'] == 'g' and gp[0]['category'] == 'Kühlregal', gp
+                assert any(i['product_id'] == gp[0]['product_id'] and i['qty'] == 800 for i in ings)
+                assert any(i['text_original'] == 'Salz und Pfeffer' and i['product_id'] == '' for i in ings), 'Salz bleibt ungeklärt statt geraten'
+                assert s['ledger']['ok']
+                wife.wait_for_selector('.rcard >> text=Ofen-Gnocchi')
+            step('Partnerin übernimmt ein Rezept per Link: Zutaten geprüft, fehlendes Produkt angelegt, Salz bleibt offen', recipe_import)
 
             def offline():
                 ev0 = ctl('stock')['events']
@@ -211,8 +252,10 @@ def main():
                 wife.fill('[data-pform="qty"]', '1')
                 if not wife.eval_on_selector('[data-pform="loc"]', 'e => e.value'):
                     wife.select_option('[data-pform="loc"]', 'KS')
+                local0 = total(wife, 'P-GURKE')
                 wife.click('[data-action="pform-book"]')
-                wait_toast(wife, 'nichts gespeichert', timeout=15000)
+                wait_toast(wife, 'Nicht gespeichert', timeout=20000)
+                assert total(wife, 'P-GURKE') == local0, 'Vorschau zurückgenommen'
                 ctl('offline', on=False)
                 assert ctl('stock')['events'] == ev0
                 assert 'Gebucht' not in wife.inner_text('#toast')

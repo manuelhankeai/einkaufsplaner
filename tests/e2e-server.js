@@ -13,7 +13,8 @@ const GAS = require('./gas-mock.js');
 
 const root = path.join(__dirname, '..');
 const port = Number(process.argv[2] || 8770);
-const g = GAS.create();
+const PAGE = fs.readFileSync(path.join(root, 'tests/fixtures/rezeptseite.html'), 'utf8');
+const g = GAS.create({ fast: true, web: (url) => (url === 'https://rezepte.example.org/gnocchi' ? { body: PAGE } : null) });
 g.props.set('GOOGLE_CLIENT_ID', 'client-123.apps.googleusercontent.com');
 let offline = false, aiReply = null;
 
@@ -53,7 +54,7 @@ http.createServer((req, res) => {
       if (c.cmd === 'mails') r = { mails: g.mails };
       if (c.cmd === 'offline') { offline = !!c.on; r = { offline }; }
       if (c.cmd === 'ai') { if (c.key) g.props.set('OPENAI_API_KEY', c.key); else g.props.delete('OPENAI_API_KEY'); aiReply = c.reply || null; r = { ai: !!c.key }; }
-      if (c.cmd === 'stock') { const s = g.ctx.tischLoad('TEST').store; r = { lots: s.tables.StockLot, events: s.tables.StockEvent.length, users: s.tables.User, items: s.tables.ShoppingItem, plan: s.tables.MealPlanEntry, ledger: g.ctx.EP.verifyLedger(s) }; }
+      if (c.cmd === 'stock') { const s = g.ctx.tischLoad('TEST').store; r = { lots: s.tables.StockLot, events: s.tables.StockEvent.length, users: s.tables.User, items: s.tables.ShoppingItem, plan: s.tables.MealPlanEntry, recipes: s.tables.Recipe, ings: s.tables.RecipeIngredient, products: s.tables.Product, aliases: s.tables.ProductAlias, ledger: g.ctx.EP.verifyLedger(s) }; }
       res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(r)); return;
     }
     let f = path.join(root, url === '/' ? 'index.html' : url);

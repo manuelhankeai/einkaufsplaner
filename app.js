@@ -104,15 +104,67 @@
         return Promise.resolve(r);
       } catch (e) { toast(e.message || String(e), true); return Promise.resolve(null); }
     }
-    setBusy(1);
-    return Net.call('exec', { command: cmd, key: key }).then(function (res) {
-      setBusy(-1);
-      if (!res.ok) { netError(res); return null; }
-      Object.keys(res.tables || {}).forEach(function (k) { store.tables[k] = res.tables[k]; });
-      rev = res.rev; Net.cacheStore(store, rev);
-      render();
-      return res.result;
+    // Online: sofort lokal mit derselben Fachlogik vorrechnen (gleiche IDs wie auf dem Server),
+    // dann in Reihenfolge an den Server. „Gespeichert ✓“ erst nach dessen Bestätigung.
+    var preview;
+    if (!sync.pending) sync.base = JSON.stringify(store.tables); // bestätigter Stand, falls etwas scheitert
+    try { preview = new EP.Engine(store, { keyedIds: true }).execute(cmd, { idempotencyKey: key, user: auth.email || 'ich' }); }
+    catch (e) { toast(e.message || String(e), true); return Promise.resolve(null); }
+    sync.pending++; sync.label = ''; showSync();
+    render();
+    var attempt = 0;
+    function send() {
+      return Net.call('exec', { command: cmd, key: key }).then(function (res) {
+        if (!res.ok && (res.code === 'BUSY' || res.code === 'OFFLINE') && attempt++ < 2) {
+          return new Promise(function (ok) { setTimeout(ok, 1500 * attempt); }).then(send); // gleicher Schlüssel → nie doppelt
+        }
+        return res;
+      });
+    }
+    sync.queue = sync.queue.then(send).then(function (res) {
+      sync.pending--;
+      if (!res.ok) { sync.failed = sync.failed || res; }
+      else { Object.keys(res.tables || {}).forEach(function (k) { sync.server[k] = res.tables[k]; }); rev = res.rev; sync.ms = res.ms; sync.fast = res.fast; }
+      if (!sync.pending) settle();
     });
+    return Promise.resolve(preview);
+  }
+  function doneTitle() { return sync.pending ? 'Wird gebucht …' : 'Gebucht ✓'; }
+  var sync = { pending: 0, queue: Promise.resolve(), server: {}, failed: null, label: '', ms: null, fast: null };
+  /** Alle ausstehenden Buchungen sind beim Server angekommen (oder gescheitert). */
+  function settle() {
+    if (sync.failed) {
+      var f = sync.failed; sync.failed = null;
+      // Vorschau zurücknehmen: bestätigter Stand + was der Server inzwischen bestätigt hat
+      store = { tables: JSON.parse(sync.base) }; ensureTables();
+      Object.keys(sync.server).forEach(function (k) { store.tables[k] = sync.server[k]; });
+      sync.server = {};
+      render(); if (sheet) renderSheet();
+      showSync('');
+      if (f.code === 'AUTH' || f.code === 'NO_ACCESS') { netError(f); return; }
+      if (f.code === 'OFFLINE') { toast('Nicht gespeichert: ' + (f.message || 'keine Verbindung'), true); return; }
+      toast('Nicht gespeichert: ' + (f.message || 'Fehler') + '. Ich habe den Stand vom Server neu geladen.', true);
+      refresh(); return;
+    }
+    Object.keys(sync.server).forEach(function (k) { store.tables[k] = sync.server[k]; });
+    sync.server = {};
+    Net.cacheStore(store, rev);
+    render();
+    if (sheet && sheet.result) renderSheet();
+    showSync('ok');
+  }
+  var syncTimer;
+  function showSync(state) {
+    var el = $('sync'); if (!el) return;
+    clearTimeout(syncTimer);
+    if (sync.pending) { el.className = 'sync on'; el.innerHTML = '<i class="spin"></i>' + esc(sync.label ? sync.label + ' · ' : '') + 'Wird gespeichert …'; return; }
+    if (state === 'ok') {
+      el.className = 'sync on ok'; el.innerHTML = '✓ ' + esc(sync.label || 'Gespeichert') + (sync.label ? ' – gespeichert' : '');
+      sync.label = '';
+      syncTimer = setTimeout(function () { el.className = 'sync'; }, 2200);
+      return;
+    }
+    el.className = 'sync';
   }
   function upsert(table, rows) { return run({ type: 'upsert_rows', table: table, rows: rows.map(clean) }); }
   function clean(row) { var o = {}; Object.keys(row).forEach(function (k) { if (k.charAt(0) !== '_') o[k] = row[k]; }); return o; }
@@ -161,7 +213,7 @@
     });
   }
   document.addEventListener('visibilitychange', function () {
-    if (document.visibilityState !== 'visible' || !Net.live() || auth.phase !== 'ready' || busy) return;
+    if (document.visibilityState !== 'visible' || !Net.live() || auth.phase !== 'ready' || busy || sync.pending) return;
     Net.call('hello').then(function (r) { if (r.ok && r.allowed && r.rev !== rev) refresh(); else if (r.ok && !r.allowed) { auth.status = r.status; lockOut(); } });
   });
   function viewAuth() {
@@ -189,6 +241,7 @@
 
   var toastTimer;
   function toast(msg, err) {
+    if (!err && sync && sync.pending) { sync.label = String(msg).replace(/\s*✓\s*$/, ''); showSync(); return; }
     var t = $('toast'); t.textContent = msg; t.className = 'toast show' + (err ? ' err' : '');
     clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.className = 'toast'; }, err ? 4200 : 2400);
   }
@@ -249,6 +302,11 @@
   function defaultPersons() { var s = T().Settings.filter(function (x) { return x.key === 'default_persons'; })[0]; return s ? Number(s.value) : 2; }
   function entryFor(dateIso) { return T().MealPlanEntry.filter(function (e) { return e.date === dateIso; })[0]; }
 
+  /** Rezeptbild (aus dem Import) oder passende Illustration */
+  function recipePic(r, cls) {
+    if (r && /^https:\/\//.test(r.image_url || '')) return '<span class="pic recipe-photo ' + (cls || 'dish') + '"><img src="' + esc(r.image_url) + '" alt="" loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror="this.parentNode.classList.add(\'fail\')">' + Illus.dishSvg(r, 'fb') + '</span>';
+    return Illus.dish(r, cls);
+  }
   function ingredientPills(pv) {
     return pv.lines.map(function (l) {
       if (l.status === 'unklar') return '<span class="tag unclear" title="' + esc(l.reason) + '">' + esc(l.text) + '?</span>';
@@ -265,7 +323,7 @@
       var r = recipe(e.recipe_id), pv = EP.previewCook(store, r.recipe_id, e.persons);
       var cooked = e.status === 'gekocht';
       var missing = pv.lines.filter(function (l) { return l.status === 'ok' && l.missing > 1e-9; }).length;
-      h += '<section class="tonight">' + Illus.dish(r, 'dish lg') +
+      h += '<section class="tonight">' + recipePic(r, 'dish lg') +
         '<div class="when">' + (cooked ? 'Heute gekocht' : e.status === 'Vorschlag' ? 'Vorschlag für heute Abend' : 'Heute Abend') + '</div>' +
         '<h2>' + esc(r.name) + '</h2><div class="facts"><span>' + e.persons + ' Personen</span><span>' + esc(r.minutes) + ' Minuten</span><span>' + (missing ? missing + ' Zutat' + (missing > 1 ? 'en fehlen' : ' fehlt') : 'Alles da') + '</span></div>' +
         '<div class="ing">' + ingredientPills(pv) + '</div>' +
@@ -357,9 +415,10 @@
     var q = state.search.toLowerCase();
     var rs = T().Recipe.filter(function (r) { return !q || r.name.toLowerCase().indexOf(q) >= 0; })
       .sort(function (a, b) { return (b.favorite ? 1 : 0) - (a.favorite ? 1 : 0) || a.name.localeCompare(b.name); });
-    var h = '<div class="inline-add"><input type="search" placeholder="Rezept suchen" aria-label="Rezept suchen" value="' + esc(state.search) + '" data-input="cb-search"><button class="btn primary" data-action="new-recipe">Neues Rezept</button></div>';
+    var h = '<div class="inline-add"><input type="search" placeholder="Rezept suchen" aria-label="Rezept suchen" value="' + esc(state.search) + '" data-input="cb-search"><button class="btn primary" data-action="new-recipe">Neu</button></div>';
+    if (Net.live()) h += '<button class="import-cta" data-action="import-recipe">' + Illus.tab('cookbook') + '<span><b>Rezept aus Link übernehmen</b><small>Chefkoch & Co. – Zutaten werden vor dem Speichern geprüft</small></span><span class="muted">›</span></button>';
     h += '<div class="recipes">' + rs.map(function (r) {
-      return '<div class="rcard-wrap"><button class="rcard" data-action="recipe" data-id="' + r.recipe_id + '">' + Illus.dish(r) + '<b>' + esc(r.name) + '</b>' +
+      return '<div class="rcard-wrap"><button class="rcard" data-action="recipe" data-id="' + r.recipe_id + '">' + recipePic(r) + '<b>' + esc(r.name) + '</b>' +
         '<span class="m">' + esc(r.minutes) + ' Min., für ' + esc(r.servings_base) + '</span>' +
         (r.disliked ? '<span class="tag bad">unerwünscht</span>' : '') + '</button>' +
         (r.favorite ? '<span class="star" aria-label="Favorit">★</span>' : '') + '</div>';
@@ -579,11 +638,79 @@
   }
   function lastLocation(pid) { var l = T().StockLot.filter(function (x) { return x.product_id === pid; }); return l.length ? l[l.length - 1].location_id : ''; }
 
+  var RECIPE_UNITS = ['g', 'kg', 'ml', 'l', 'Stk', 'Pkg', 'EL', 'TL', 'Prise', 'Msp', 'Bund', 'Zehe', 'Scheibe', 'Tasse', 'Handvoll', 'Schuss', 'Knolle', 'Stange', 'Zweig', 'Blatt', 'Würfel', 'Kopf'];
+  /** Was beim Kochen mit dieser Zutat passiert – ehrlich, ohne zu raten */
+  function ingCheck(x) {
+    if (x.pid === '') return { cls: 'unclear', text: 'Ohne Zuordnung – wird beim Kochen nicht abgebucht' };
+    if (x.qty === '' || x.qty == null) return { cls: 'unclear', text: 'Ohne Menge – wird nicht abgebucht' };
+    var p = x.pid === '__new' ? { base_unit: x.newUnit } : product(x.pid);
+    if (!p) return { cls: 'unclear', text: 'Produkt fehlt' };
+    if (x.pid === '__new') {
+      var u = x.unit || x.newUnit;
+      var okU = u === x.newUnit || (x.newUnit === 'g' && u === 'kg') || (x.newUnit === 'ml' && (u === 'l' || u === 'cl'));
+      return okU ? { cls: 'ok', text: 'Neues Produkt „' + x.newName + '“ (' + x.newUnit + ')' } : { cls: 'unclear', text: u + ' lässt sich nicht in ' + x.newUnit + ' umrechnen – wird nicht abgebucht' };
+    }
+    var r = EP.toBase(store, x.pid, Number(x.qty), x.unit || p.base_unit);
+    return r.ok ? { cls: 'ok', text: '→ ' + p.name + (x.unit && x.unit !== p.base_unit ? ' (' + fmtNum(r.qty_base) + ' ' + p.base_unit + ')' : '') } : { cls: 'unclear', text: r.reason + ' – wird nicht abgebucht' };
+  }
+  function importIngCard(x, i) {
+    var c = ingCheck(x);
+    var opts = '<option value="">Ohne Zuordnung</option><option value="__new"' + (x.pid === '__new' ? ' selected' : '') + '>+ Neu anlegen: ' + esc(x.newName) + '</option>';
+    if (x.candidates && x.candidates.length) opts += '<optgroup label="Vorschläge">' + x.candidates.map(function (cd) { return '<option value="' + cd.product_id + '"' + (cd.product_id === x.pid ? ' selected' : '') + '>' + esc(cd.name) + '</option>'; }).join('') + '</optgroup>';
+    opts += '<optgroup label="Alle Produkte">' + T().Product.slice().sort(function (a, b) { return a.name.localeCompare(b.name); }).map(function (p) { return '<option value="' + p.product_id + '"' + (p.product_id === x.pid ? ' selected' : '') + '>' + esc(p.name) + '</option>'; }).join('') + '</optgroup>';
+    var units = RECIPE_UNITS.slice(); if (x.unit && units.indexOf(x.unit) < 0) units.unshift(x.unit);
+    var h = '<div class="action-card ing-card ' + c.cls + '"><div class="raw">' + esc(x.text_original) + (x.note && String(x.text_original).indexOf(x.note) < 0 ? ' <span class="muted">· ' + esc(x.note) + '</span>' : '') + '</div>' +
+      '<div class="field"><select data-ing="pid" data-idx="' + i + '" aria-label="Produkt">' + opts + '</select></div>' +
+      '<div class="grid2"><input type="number" inputmode="decimal" step="any" min="0" placeholder="Menge" value="' + esc(x.qty == null ? '' : x.qty) + '" data-ing="qty" data-idx="' + i + '" aria-label="Menge">' +
+      '<select data-ing="unit" data-idx="' + i + '" aria-label="Einheit"><option value="">' + (x.pid && x.pid !== '__new' && product(x.pid) ? product(x.pid).base_unit : 'Einheit') + '</option>' + units.map(function (u) { return '<option' + (u === x.unit ? ' selected' : '') + '>' + u + '</option>'; }).join('') + '</select></div>';
+    if (x.pid === '__new') h += '<div class="grid2" style="margin-top:8px"><select data-ing="newUnit" data-idx="' + i + '" aria-label="Gezählt in">' + [['g', 'in Gramm'], ['ml', 'in Milliliter'], ['Stk', 'in Stück']].map(function (u) { return '<option value="' + u[0] + '"' + (u[0] === x.newUnit ? ' selected' : '') + '>' + u[1] + '</option>'; }).join('') + '</select>' +
+      '<select data-ing="newCat" data-idx="' + i + '" aria-label="Abteilung">' + DEPT_ORDER.filter(function (d) { return d !== 'Unklar'; }).map(function (d) { return '<option' + (d === x.newCat ? ' selected' : '') + '>' + d + '</option>'; }).join('') + '</select></div>';
+    return h + '<div class="small ing-check ' + c.cls + '">' + esc(c.text) + '</div></div>';
+  }
+  function guessBase(unit) { return /^(g|kg)$/.test(unit) ? 'g' : /^(ml|l|cl)$/.test(unit) ? 'ml' : 'Stk'; }
+  function guessDept(name) {
+    var n = String(name).toLowerCase();
+    if (/salat|tomate|gurke|zwiebel|knoblauch|kartoffel|möhre|karotte|paprika|zucchini|petersilie|basilikum|schnittlauch|apfel|zitrone|banane|lauch|spinat|pilz|champignon|ingwer|kräuter|avocado|aubergine|brokkoli/.test(n)) return 'Obst & Gemüse';
+    if (/milch|sahne|joghurt|quark|käse|feta|mozzarella|parmesan|butter|ei$|eier|schmand|frischkäse|gnocchi|maultasche|speck|schinken|wurst|hähnchen|hackfleisch|tofu/.test(n)) return 'Kühlregal';
+    if (/brot|brötchen|bun|toast|baguette|wrap|tortilla/.test(n)) return 'Brot & Backwaren';
+    if (/tiefkühl|tk |erbsen|pommes/.test(n)) return 'Tiefkühl';
+    return 'Vorrat';
+  }
+
   var SHEETS = {
+    importRecipe: function () {
+      var st = sheet;
+      if (!st.data) {
+        var h = head('Rezept übernehmen');
+        h += '<div class="seg" style="margin-bottom:12px"><button class="' + (st.mode === 'link' ? 'on' : '') + '" data-action="imp-mode" data-v="link">Link</button><button class="' + (st.mode === 'text' ? 'on' : '') + '" data-action="imp-mode" data-v="text">Text einfügen</button></div>';
+        h += st.mode === 'link' ? '<div class="field"><label for="impUrl">Link zur Rezeptseite</label><input id="impUrl" type="url" inputmode="url" autocomplete="off" placeholder="https://www.chefkoch.de/rezepte/…" value="' + esc(st.url) + '" data-impin="url"></div>' :
+          '<div class="field"><label for="impText">Rezepttext (Name, Zutaten, Zubereitung)</label><textarea id="impText" data-impin="text" placeholder="Name in der ersten Zeile, dann Zutaten …">' + esc(st.text) + '</textarea></div>';
+        h += '<button class="btn primary block" data-action="imp-load"' + (st.loading ? ' disabled' : '') + '>' + (st.loading ? 'Lade und prüfe …' : 'Rezept holen') + '</button>';
+        h += '<p class="small muted" style="margin-top:12px">Ich lese Name, Portionen, Zeit, Zutaten und Schritte aus. Gespeichert wird erst, wenn du die Zutaten geprüft hast.' + (ai.configured ? ' Seiten ohne Rezeptdaten wertet die KI aus.' : '') + '</p>';
+        return h;
+      }
+      var d = st.data, r = d.recipe;
+      var dup = r.source_url && T().Recipe.filter(function (x) { return x.source_url === r.source_url; })[0];
+      var open = d.ingredients.filter(function (x) { return ingCheck(x).cls !== 'ok'; }).length;
+      var h2 = head('Prüfen & speichern');
+      if (r.image_url) h2 += '<img class="imp-photo" src="' + esc(r.image_url) + '" alt="" referrerpolicy="no-referrer" onerror="this.remove()">';
+      if (dup) h2 += '<div class="note">„' + esc(dup.name) + '“ mit diesem Link ist schon im Kochbuch. Speichern legt eine zweite Fassung an.</div>';
+      h2 += '<div class="field"><label>Name</label><input type="text" data-impr="name" value="' + esc(r.name) + '"></div>';
+      h2 += '<div class="grid2"><div class="field"><label>Portionen (Rezept ist für …)</label><input type="number" inputmode="numeric" min="1" data-impr="servings" value="' + esc(r.servings || '') + '" placeholder="fehlt" style="' + (r.servings ? '' : 'outline:2px solid var(--warn)') + '"></div>' +
+        '<div class="field"><label>Minuten</label><input type="number" inputmode="numeric" data-impr="minutes" value="' + esc(r.minutes || '') + '"></div></div>';
+      h2 += '<div class="sec">Zutaten <span class="aside">' + (open ? open + ' noch offen' : 'alles zugeordnet') + '</span></div>';
+      h2 += '<p class="small muted" style="margin:-4px 4px 10px">Gelb: wird beim Kochen nicht abgebucht, bis es geklärt ist. Speichern geht trotzdem; zuordnen kannst du auch später. Zuordnungen gelten künftig für alle Rezepte, Bons und Sprache.</p>';
+      h2 += d.ingredients.map(importIngCard).join('');
+      h2 += '<div class="sec">Zubereitung</div><div class="field"><textarea data-impr="steps" rows="6">' + esc(r.steps) + '</textarea></div>';
+      h2 += '<p class="small muted">Quelle: ' + esc(d.source) + (r.source_url ? ' · <a href="' + esc(r.source_url) + '" target="_blank" rel="noopener">Seite öffnen</a>' : '') + '</p>';
+      h2 += '<button class="btn primary block" data-action="imp-save"' + (r.name && r.servings ? '' : ' disabled') + '>Ins Kochbuch</button>';
+      if (!r.servings) h2 += '<p class="small muted" style="text-align:center">Bitte Portionen angeben – sonst lässt sich nicht richtig umrechnen.</p>';
+      return h2;
+    },
     cook: function () {
       var r = recipe(sheet.recipe_id);
       if (sheet.result) {
-        return head('Gebucht ✓') + '<div class="panel">' + sheet.result.lines.map(function (l) {
+        return head(doneTitle()) + '<div class="panel">' + sheet.result.lines.map(function (l) {
           var p = l.product_id ? product(l.product_id) : null;
           var right = l.status === 'ok' ? '<span class="qty">−' + esc(fmtQty(l.product_id, l.booked, false)) + '</span>' :
             l.status === 'teilweise' ? '<span class="tag warn">−' + esc(fmtQty(l.product_id, l.booked, false)) + ', fehlte ' + esc(fmtQty(l.product_id, l.missing, false)) + '</span>' :
@@ -612,7 +739,7 @@
       var r = recipe(sheet.id), p = sheet.persons;
       var ings = T().RecipeIngredient.filter(function (i) { return i.recipe_id === r.recipe_id; }).sort(function (a, b) { return a.line_no - b.line_no; });
       var h = head(esc(r.name));
-      h += '<div class="sheet-hero">' + Illus.dish(r) + '<div class="muted">' + esc(r.minutes) + ' Minuten<br>Grundrezept für ' + esc(r.servings_base) + (r.source_url ? '<br><a href="' + esc(r.source_url) + '" target="_blank" rel="noopener">Quelle öffnen</a>' : '') + '</div></div>';
+      h += '<div class="sheet-hero">' + recipePic(r) + '<div class="muted">' + esc(r.minutes) + ' Minuten<br>Grundrezept für ' + esc(r.servings_base) + (r.source_url ? '<br><a href="' + esc(r.source_url) + '" target="_blank" rel="noopener">Quelle öffnen</a>' : '') + '</div></div>';
       h += '<div class="row" style="padding:0 2px 12px;border:0"><div class="grow muted">Personen</div><div class="stepper"><button data-action="recipe-persons" data-d="-1">−</button><span>' + p + '</span><button data-action="recipe-persons" data-d="1">+</button></div></div>';
       h += '<div class="panel">' + ings.map(function (i) {
         var q = i.qty === '' || i.qty == null ? null : Number(i.qty) * (i.per === 'Person' ? p : p / Number(r.servings_base || 2));
@@ -634,7 +761,7 @@
       h += '<div class="field"><label>Zutaten, eine pro Zeile: „Menge Einheit Zutat“, optional „pro Person“</label><textarea data-draft="ingredients" placeholder="125 g Spaghetti pro Person&#10;1 Zwiebel&#10;Salz">' + esc(d.ingredients) + '</textarea></div>';
       h += '<div class="field"><label>Zubereitung (ein Schritt pro Zeile)</label><textarea data-draft="steps">' + esc(d.steps) + '</textarea></div>';
       h += '<div class="field"><label>Rezeptlink (optional)</label><input type="text" inputmode="url" data-draft="url" value="' + esc(d.url) + '" placeholder="https://…"></div>';
-      if (d.url) h += '<div class="note">Automatischer Import von Links kommt mit dem Server-Teil. Der Link wird als Quelle gespeichert.</div>';
+      if (d.url && Net.live()) h += '<div class="note">Für Links gibt es den Import mit Prüfung: Kochbuch → „Rezept aus Link übernehmen“.</div>';
       var parsed = parseIngredients(d.ingredients);
       if (parsed.length) h += '<div class="sec">Prüfung</div><div class="panel">' + parsed.map(function (x) {
         return '<div class="row"><span class="dot ' + (x.product_id && x.qty != null ? 'ok' : 'unclear') + '"></span><div class="grow"><div class="title">' + esc(x.text) + '</div><div class="sub">' + (x.product_id ? '→ ' + esc(product(x.product_id).name) : x.suggest ? 'Meinst du ' + esc(x.suggest) + '? Ohne Bestätigung keine Zuordnung' : 'kein Produkt, wird nicht abgebucht') + (x.qty == null ? ' · ohne Menge' : '') + '</div></div><div class="qty">' + (x.qty != null ? esc(fmtNum(x.qty) + ' ' + x.unit) : '') + (x.per === 'Person' ? '<div class="small muted">pro Person</div>' : '') + '</div></div>';
@@ -750,7 +877,7 @@
     bookChecked: function () {
       var h = head('In den Vorrat buchen');
       if (sheet.result) {
-        return head('Gebucht ✓') + '<p>' + sheet.result.booked.length + ' Position(en) im Vorrat gebucht.</p>' + (sheet.result.skipped.length ? '<div class="note">' + sheet.result.skipped.length + ' nicht gebucht: ' + esc(sheet.result.skipped.map(function (s) { return s.reason; }).join('; ')) + '</div>' : '') + '<button class="btn primary block" data-action="close-sheet">Fertig</button>';
+        return head(doneTitle()) + '<p>' + sheet.result.booked.length + ' Position(en) im Vorrat gebucht.</p>' + (sheet.result.skipped.length ? '<div class="note">' + sheet.result.skipped.length + ' nicht gebucht: ' + esc(sheet.result.skipped.map(function (s) { return s.reason; }).join('; ')) + '</div>' : '') + '<button class="btn primary block" data-action="close-sheet">Fertig</button>';
       }
       h += '<div class="note info">Lagerorte sind nach Abteilung vorbelegt. Bitte kurz prüfen.</div>';
       h += sheet.lines.map(function (l, idx) {
@@ -899,23 +1026,13 @@
   function parseIngredients(text) {
     return String(text || '').split('\n').map(function (l) { return l.trim(); }).filter(Boolean).map(function (line) {
       var per = /\bpro person\b|\bje person\b/i.test(line) ? 'Person' : 'Rezept';
-      var s = line.replace(/\b(pro|je) person\b/i, '').trim();
-      var m = s.match(/^([\d.,\/½¼¾]+)\s*(.*)$/);
-      var qty = null, rest = s, unit = '';
-      if (m) {
-        var qs = m[1].replace('½', '.5').replace('¼', '.25').replace('¾', '.75').replace(',', '.');
-        qty = qs.indexOf('/') > 0 ? Number(qs.split('/')[0]) / Number(qs.split('/')[1]) : Number(qs);
-        rest = m[2];
-        var w = rest.split(/\s+/)[0];
-        var nu = EP.normUnit(w);
-        if (['g', 'kg', 'ml', 'l', 'cl', 'Stk', 'Pkg'].indexOf(nu) >= 0) { unit = nu; rest = rest.slice(w.length).trim(); }
-      }
-      var r = EP.resolveProduct(store, rest);
-      var pid = r.status === 'resolved' ? r.product_id : '';
-      if (pid && !unit) unit = product(pid).base_unit;
-      return { text: rest, qty: isNaN(qty) ? null : qty, unit: unit, per: per, product_id: pid, suggest: r.status === 'suggestion' ? r.candidates[0].name : '' };
+      var x = EP.parseIngredientLine(line.replace(/\b(pro|je) person\b/i, '').trim());
+      var rr = EP.resolveProduct(store, x.name);
+      var pid0 = rr.status === 'resolved' ? rr.product_id : '';
+      return { text: x.name, qty: x.qty, unit: x.unit || (pid0 && x.qty != null ? product(pid0).base_unit : ''), per: per, product_id: pid0, suggest: rr.status === 'suggestion' ? rr.candidates[0].name : '', note: x.note };
     });
   }
+
 
   // ------------------------------------------------------------- Aktionen
   var ACTIONS = {
@@ -973,11 +1090,60 @@
     'recipe-persons': function (el) { sheet.persons = Math.max(1, sheet.persons + Number(el.getAttribute('data-d'))); renderSheet(); },
     fav: function (el) { var r = recipe(el.getAttribute('data-id')); upsert('Recipe', [{ recipe_id: r.recipe_id, favorite: !r.favorite }]).then(function () { renderSheet(); }); },
     dislike: function (el) { var r = recipe(el.getAttribute('data-id')); upsert('Recipe', [{ recipe_id: r.recipe_id, disliked: !r.disliked }]).then(function () { renderSheet(); }); },
+    'import-recipe': function () {
+      if (!Net.live()) return toast('Der Import braucht die Online-Verbindung', true);
+      openSheet({ type: 'importRecipe', mode: 'link', url: '', text: '', data: null, key: uuid() });
+      setTimeout(function () { var i = $('impUrl'); if (i) i.focus(); }, 250);
+    },
+    'imp-mode': function (el) { sheet.mode = el.getAttribute('data-v'); renderSheet(); },
+    'imp-load': function () {
+      var st = sheet, body = st.mode === 'link' ? { url: (st.url || '').trim() } : { text: (st.text || '').trim() };
+      if (!body.url && !body.text) return toast(st.mode === 'link' ? 'Bitte einen Link einfügen' : 'Bitte Text einfügen', true);
+      st.loading = true; renderSheet();
+      Net.call('import_recipe', body, { timeout: 90000 }).then(function (r) {
+        st.loading = false;
+        if (sheet !== st) return;
+        if (!r.ok) { renderSheet(); return netError(r); }
+        r.ingredients.forEach(function (x) {
+          x.pid = x.product_id || '';
+          x.newName = cap(x.name || x.text_original);
+          x.newUnit = guessBase(x.unit); x.newCat = guessDept(x.name);
+          x.auto = !!x.product_id;
+        });
+        st.data = r; renderSheet();
+      });
+    },
+    'imp-save': function (el) {
+      var st = sheet, d = st.data, r = d.recipe, rid = st.rid || (st.rid = 'R-' + uuid().slice(0, 8).toUpperCase());
+      var cmds = [], rows = [];
+      d.ingredients.forEach(function (x, i) {
+        var pid = x.pid;
+        if (pid === '__new') {
+          var ex = EP.resolveProduct(store, x.newName);
+          if (ex.status === 'resolved') pid = ex.product_id;
+          else { pid = x.newId || (x.newId = 'P-' + uuid().slice(0, 8).toUpperCase()); cmds.push({ type: 'create_product', product_id: pid, name: x.newName, category: x.newCat, base_unit: x.newUnit }); }
+        }
+        // bewusst gewählte Zuordnung als globale Regel speichern (gilt dann für alle Rezepte, Bons, Sprache)
+        if (pid && !x.auto && x.pid !== '__new') {
+          var rr = EP.resolveProduct(store, x.name);
+          if (!(rr.status === 'resolved' && rr.product_id === pid)) cmds.push({ type: 'confirm_alias', alias: x.name, product_id: pid, source: 'rezept' });
+        }
+        rows.push({ recipe_id: rid, line_no: i + 1, product_id: pid || '', text_original: x.text_original, qty: x.qty === '' || x.qty == null ? '' : Number(x.qty), unit: x.unit || '', per: 'Rezept', optional: !!x.optional, note: x.note || '' });
+      });
+      cmds.push({ type: 'upsert_rows', table: 'Recipe', rows: [{ recipe_id: rid, name: r.name.trim(), category: r.category || 'Importiert', servings_base: Number(r.servings), minutes: Number(r.minutes) || '', steps: r.steps, source_url: r.source_url || '', image_url: r.image_url || '', favorite: false, disliked: false, repeat_every_days: 7, notes: '', version: 1 }] });
+      cmds.push({ type: 'upsert_rows', table: 'RecipeIngredient', rows: rows });
+      el.disabled = true;
+      run({ type: 'batch', commands: cmds }, st.key).then(function (res) {
+        if (!res) { el.disabled = false; return; }
+        toast('„' + r.name.trim() + '“ im Kochbuch');
+        closeSheet(); state.tab = 'cookbook'; render();
+      });
+    },
     'new-recipe': function () { openSheet({ type: 'newRecipe', draft: { name: '', minutes: 20, servings: 2, category: 'Schnell', ingredients: '', steps: '', url: '' } }); },
     'save-recipe': function () {
       var d = sheet.draft, id = sheet.draftId || (sheet.draftId = 'R-' + uuid().slice(0, 8).toUpperCase());
       if (!d.name.trim()) return toast('Bitte einen Namen eingeben', true);
-      var ings = parseIngredients(d.ingredients).map(function (x, i) { return { recipe_id: id, line_no: i + 1, product_id: x.product_id, text_original: x.text, qty: x.qty == null ? '' : x.qty, unit: x.unit, per: x.per, optional: false, note: '' }; });
+      var ings = parseIngredients(d.ingredients).map(function (x, i) { return { recipe_id: id, line_no: i + 1, product_id: x.product_id, text_original: x.text, qty: x.qty == null ? '' : x.qty, unit: x.unit, per: x.per, optional: false, note: x.note || '' }; });
       var cmds = [{ type: 'upsert_rows', table: 'Recipe', rows: [{ recipe_id: id, name: d.name.trim(), category: d.category, servings_base: Number(d.servings) || 2, minutes: Number(d.minutes) || '', steps: d.steps, source_url: d.url, favorite: false, disliked: false, repeat_every_days: 7, notes: '', version: 1 }] }];
       if (ings.length) cmds.push({ type: 'upsert_rows', table: 'RecipeIngredient', rows: ings });
       sheet.saveKey = sheet.saveKey || uuid();
@@ -1000,8 +1166,7 @@
     'shop-check': function (el) {
       var i = itemRow(el.getAttribute('data-item'));
       if (!i || i.purchase_id) return;
-      i.checked = !i.checked; render(); // sofort sichtbar; Server bestätigt oder setzt zurück
-      upsert('ShoppingItem', [Object.assign({}, i)]).then(function (r) { if (!r) { i.checked = !i.checked; render(); } });
+      upsert('ShoppingItem', [Object.assign({}, i, { checked: !i.checked })]);
     },
     'add-item': function () {
       var inp = $('addItem'); var txt = inp.value.trim(); if (!txt) return;
@@ -1084,7 +1249,7 @@
       });
     },
     'new-product': function () { openSheet({ type: 'newProduct', form: { name: '', category: 'Sonstiges', unit: 'Stk' } }); },
-    'save-product': function () { var f = sheet.form; sheet.saveKey = sheet.saveKey || uuid(); run({ type: 'create_product', name: f.name, category: f.category, base_unit: f.unit }, sheet.saveKey).then(function (r) { if (r) { toast('Angelegt'); openSheet({ type: 'product', id: r.product_id, key: uuid(), form: { intent: 'add', qty: '', unit: f.unit, loc: state.loc !== 'all' ? state.loc : '', bb: '' } }); } }); },
+    'save-product': function () { var f = sheet.form; sheet.saveKey = sheet.saveKey || uuid(); run({ type: 'create_product', product_id: sheet.newId || (sheet.newId = 'P-' + uuid().slice(0, 8).toUpperCase()), name: f.name, category: f.category, base_unit: f.unit }, sheet.saveKey).then(function (r) { if (r) { toast('Angelegt'); openSheet({ type: 'product', id: r.product_id, key: uuid(), form: { intent: 'add', qty: '', unit: f.unit, loc: state.loc !== 'all' ? state.loc : '', bb: '' } }); } }); },
     'edit-product': function (el) { var p = product(el.getAttribute('data-id')), k = pkgOf(p); openSheet({ type: 'editProduct', id: p.product_id, form: { label: k ? k.label : '', qty: k ? k.content_qty : '', unit: k ? k.content_unit : p.base_unit } }); },
     'save-package': function () {
       var f = sheet.form; if (!f.qty || isNaN(Number(f.qty))) return toast('Bitte den Inhalt angeben', true);
@@ -1095,7 +1260,7 @@
     'new-alias': function () { openSheet({ type: 'alias', form: { text: '', pid: '' } }); },
     'save-alias': function () { run({ type: 'confirm_alias', alias: sheet.form.text, product_id: sheet.form.pid, source: 'manuell' }).then(function (r) { if (r) { toast('Regel gespeichert' + (r.recipe_ingredients_updated ? ', ' + r.recipe_ingredients_updated + ' Rezeptzutat(en) zugeordnet' : '')); closeSheet(); } }); },
     'new-location': function () { openSheet({ type: 'newLocation' }); },
-    'save-location': function () { run({ type: 'create_location', name: $('locName').value }).then(function (r) { if (r) { toast('Lagerort angelegt'); closeSheet(); } }); },
+    'save-location': function () { run({ type: 'create_location', location_id: 'LO-' + uuid().slice(0, 6).toUpperCase(), name: $('locName').value }).then(function (r) { if (r) { toast('Lagerort angelegt'); closeSheet(); } }); },
     journal: function () { openSheet({ type: 'journal' }); },
     export: function () {
       var blob = new Blob([JSON.stringify(store, null, 1)], { type: 'application/json' });
@@ -1165,6 +1330,9 @@
     var el = ev.target;
     if (el.getAttribute('data-input') === 'cb-search') { state.search = el.value; var pos = el.selectionStart; render(); var n = document.querySelector('[data-input="cb-search"]'); n.focus(); n.setSelectionRange(pos, pos); }
     if (el.hasAttribute('data-draft')) { sheet.draft[el.getAttribute('data-draft')] = el.value; }
+    if (el.hasAttribute('data-impin')) sheet[el.getAttribute('data-impin')] = el.value;
+    if (el.hasAttribute('data-impr')) { sheet.data.recipe[el.getAttribute('data-impr')] = el.value; if (el.getAttribute('data-impr') !== 'steps') { var sb = document.querySelector('[data-action="imp-save"]'); if (sb) sb.disabled = !(sheet.data.recipe.name.trim() && Number(sheet.data.recipe.servings) > 0); } }
+    if (el.hasAttribute('data-ing') && el.tagName === 'INPUT') sheet.data.ingredients[+el.getAttribute('data-idx')][el.getAttribute('data-ing')] = el.value;
     if (el.getAttribute('data-voice') === 'text') sheet.text = el.value;
     if (el.hasAttribute('data-act') && el.tagName === 'INPUT') { sheet.actions[+el.getAttribute('data-idx')][el.getAttribute('data-act')] = el.value; }
     if (el.hasAttribute('data-pform') && el.tagName === 'INPUT') sheet.form[el.getAttribute('data-pform')] = el.value;
@@ -1180,6 +1348,14 @@
       upsert('MealPlanEntry', [Object.assign({}, e, { recipe_id: el.value, status: el.value ? 'Vorschlag' : '', note: '' })]); return;
     }
     if (ch === 'cook-qty') { sheet.overrides[el.getAttribute('data-line')] = { qty: Number(el.value), unit: product(EP.previewCook(store, sheet.recipe_id, sheet.persons).lines.filter(function (l) { return String(l.line_no) === el.getAttribute('data-line'); })[0].product_id).base_unit }; renderSheet(); return; }
+    if (el.hasAttribute('data-ing')) {
+      var ing = sheet.data.ingredients[+el.getAttribute('data-idx')], fld = el.getAttribute('data-ing');
+      ing[fld] = el.value;
+      if (fld === 'pid') ing.auto = false;
+      if (fld === 'unit' && ing.pid === '__new' && /^(g|kg|ml|l|cl|Stk)$/.test(el.value)) ing.newUnit = guessBase(el.value);
+      renderSheet(); return;
+    }
+    if (el.hasAttribute('data-impr') && el.tagName === 'INPUT') { renderSheet(); return; }
     if (ch === 'inv-loc') { sheet.loc = el.value; sheet.rows = el.value ? inventoryRows(el.value) : []; renderSheet(); return; }
     if (ch === 'inv-qty') { sheet.rows[+el.getAttribute('data-idx')].qty = el.value; return; }
     if (ch === 'inv-add' && el.value) { sheet.rows.push({ product_id: el.value, before: 0, qty: '' }); renderSheet(); return; }

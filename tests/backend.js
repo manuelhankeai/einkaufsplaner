@@ -17,9 +17,12 @@ function test(name, fn) {
 }
 const near = (a, b, msg) => assert.ok(Math.abs(a - b) < 1e-6, (msg || '') + ` – erwartet ${b}, ist ${a}`);
 
-console.log('Backend (Apps Script) – Tests mit nachgebauten Google-Diensten\n');
+const FAST = process.env.TISCH_FAST === '1';
+console.log('Backend (Apps Script) – Tests mit nachgebauten Google-Diensten' + (FAST ? ' [mit Sheets-Dienst]' : ' [ohne Sheets-Dienst]') + '\n');
 
-const g = GAS.create();
+const PAGE = fs.readFileSync(path.join(__dirname, 'fixtures/rezeptseite.html'), 'utf8');
+let webCalls = [];
+const g = GAS.create({ fast: FAST, web: (url, o) => { webCalls.push({ url, o }); if (url === 'https://rezepte.example.org/gnocchi') return { body: PAGE }; if (url === 'https://rezepte.example.org/ohne-daten') return { body: '<html><body><h1>Omas Linsensuppe</h1><p>Zutaten: 250 g Linsen, 1 Zwiebel</p></body></html>' }; if (url.includes('kaputt')) return { code: 404, body: 'weg' }; return null; } });
 /** Einmal mit Google anmelden → Gerätesitzung */
 const login = (gg, tok) => { const r = gg.post({ action: 'login', env: 'TEST', idToken: tok }); assert.strictEqual(r.ok, true, JSON.stringify(r)); return r.session; };
 let M, F, k = 0;
@@ -38,7 +41,7 @@ test('Ohne Anmeldung / mit fremder App / abgelaufen: kein Zugriff', () => {
   assert.strictEqual(g.post({ action: 'bootstrap', env: 'TEST' }).code, 'AUTH');
   assert.strictEqual(g.post({ action: 'login', env: 'TEST', idToken: 'gefälscht' }).code, 'AUTH');
   assert.strictEqual(g.post({ action: 'bootstrap', env: 'TEST', session: 'ausgedacht' }).code, 'AUTH');
-  const g2 = GAS.create({ tokens: { 'tok-andere-app': { email: 'x@example.org', aud: 'andere-app' }, 'tok-alt': { email: 'y@example.org', exp: '1000' } } });
+  const g2 = GAS.create({ fast: FAST, tokens: { 'tok-andere-app': { email: 'x@example.org', aud: 'andere-app' }, 'tok-alt': { email: 'y@example.org', exp: '1000' } } });
   assert.strictEqual(g2.post({ action: 'login', env: 'TEST', idToken: 'tok-andere-app' }).code, 'AUTH');
   assert.strictEqual(g2.post({ action: 'login', env: 'TEST', idToken: 'tok-alt' }).code, 'AUTH');
 });
@@ -226,6 +229,25 @@ test('Gleichzeitiges Speichern: belegte Sperre → klare Meldung, nichts gebucht
   same('nach Sperre');
 });
 
+test('Tempo: eine Buchung = 1 Lese- und 1 Schreibaufruf (mit Sheets-Dienst); Antwort enthält Laufzeit', () => {
+  const b0 = g.stats.batchGet, u0 = g.stats.batchUpdate;
+  const r = ok(ex(M, { type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 1, unit: 'Stk' }, 'tempo-1'));
+  refEng.execute({ type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 1, unit: 'Stk' }, { idempotencyKey: 'tempo-1', user: 'ref' });
+  assert.strictEqual(typeof r.ms, 'number');
+  if (FAST) { assert.strictEqual(g.stats.batchGet - b0, 1, 'Lesen'); assert.strictEqual(g.stats.batchUpdate - u0, 1, 'Schreiben'); assert.strictEqual(r.fast, true); }
+  else assert.strictEqual(r.fast, false);
+  same('nach Tempo-Test');
+});
+
+test('IDs von Vorschau (Browser) und Server sind gleich', () => {
+  const s = { tables: JSON.parse(JSON.stringify(fresh())) };
+  const prev = new EP.Engine(s, { keyedIds: true }).execute({ type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 2, unit: 'Stk' }, { idempotencyKey: 'vorschau-1', user: 'x' });
+  const r = ok(ex(F, { type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 2, unit: 'Stk' }, 'vorschau-1'));
+  refEng.execute({ type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 2, unit: 'Stk' }, { idempotencyKey: 'vorschau-1', user: 'ref' });
+  assert.deepStrictEqual(r.result.events, prev.events);
+  assert.strictEqual(r.result.tx_id, prev.tx_id);
+});
+
 test('Fehlerhafte Buchung (zu viel entnommen) → Fehlermeldung, Tabellen unverändert', () => {
   const snap = JSON.stringify(g.spreadsheets[g.ids.TEST].sheets.StockLot.cells);
   const r = ex(M, { type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: -50, unit: 'Stk' });
@@ -266,7 +288,7 @@ test('Sicherheitsstopp: falsch gekennzeichnete Tabelle wird nicht beschrieben; n
 });
 
 test('Falsche Spalten in einem Blatt → klarer Fehler statt Fehlbuchung', () => {
-  const g3 = GAS.create();
+  const g3 = GAS.create({ fast: FAST });
   g3.sheet('TEST', 'StockLot').cells[0][3] = 'menge';
   const r3 = g3.post({ action: 'login', env: 'TEST', idToken: 'tok-besitzer' });
   assert.strictEqual(g3.post({ action: 'bootstrap', env: 'TEST', session: r3.session }).code, 'SCHEMA');
@@ -339,6 +361,77 @@ test('Abgelaufene Sitzung (nach 60 Tagen ohne Nutzung) → erneut anmelden', () 
   const key = [...g.props.keys()].filter((x) => x.startsWith('S_')).pop();
   const v = JSON.parse(g.props.get(key)); v.exp = Date.now() - 1000; g.props.set(key, JSON.stringify(v));
   assert.strictEqual(g.post({ action: 'bootstrap', env: 'TEST', session: S }).code, 'AUTH');
+});
+
+// ----------------------------------------------------------------- Rezept-Import
+test('Rezept-Import per Link: Name, Portionen, Zeit, Schritte, Bild, Zutaten zerlegt und zugeordnet – nichts gespeichert', () => {
+  g.props.delete('OPENAI_API_KEY');
+  const before = JSON.stringify(fresh().Recipe);
+  const r = ok(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'https://rezepte.example.org/gnocchi' }));
+  assert.strictEqual(r.source, 'Rezeptdaten der Seite');
+  assert.strictEqual(r.recipe.name, 'Ofen-Gnocchi mit Tomaten & Feta');
+  assert.strictEqual(r.recipe.servings, 4); assert.strictEqual(r.recipe.minutes, 30);
+  assert.strictEqual(r.recipe.steps.split('\n').length, 3);
+  assert.strictEqual(r.recipe.image_url, 'https://bilder.example.org/gnocchi.jpg');
+  const by = (n) => r.ingredients.find((i) => i.name === n);
+  assert.deepStrictEqual([by('Knoblauch').qty, by('Knoblauch').unit, by('Knoblauch').note], [2, 'Zehe', 'fein gehackt']);
+  assert.strictEqual(by('Salz und Pfeffer').qty, null, 'keine erfundene Menge');
+  const maul = by('Maultaschen');
+  assert.strictEqual(maul.product_id, 'P-MAUL', 'bekanntes Produkt automatisch zugeordnet'); assert.strictEqual(maul.unit, 'Stk'); assert.strictEqual(maul.check, '');
+  assert.strictEqual(by('Gnocchi').product_id, ''); assert.strictEqual(by('Gnocchi').check, 'Produkt zuordnen');
+  assert.strictEqual(JSON.stringify(fresh().Recipe), before, 'Import speichert nichts');
+  assert.ok(/Mozilla/.test(webCalls[webCalls.length - 1].o.headers['User-Agent']));
+});
+
+test('Rezept-Import: Seite ohne Rezeptdaten → klare Meldung (ohne KI); kaputter Link → Fehler', () => {
+  assert.strictEqual(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'https://rezepte.example.org/ohne-daten' }).code, 'NO_RECIPE');
+  assert.strictEqual(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'https://rezepte.example.org/kaputt' }).code, 'FETCH');
+  assert.strictEqual(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'kein link' }).code, 'BAD_REQUEST');
+});
+
+test('Rezept-Import mit KI: Seite ohne Rezeptdaten wird aus dem Text gelesen, Zutaten per KI zerlegt', () => {
+  g.props.set('OPENAI_API_KEY', 'sk-test');
+  const sent = [];
+  g.setOpenAI((url, o) => {
+    const b = JSON.parse(o.payload); sent.push(b.text.format.name);
+    if (b.text.format.name === 'rezept') return { body: { output_text: JSON.stringify({ name: 'Omas Linsensuppe', servings: null, minutes: null, ingredients: ['250 g Linsen', '1 Zwiebel'], steps: [], category: null }) } };
+    return { body: { output_text: JSON.stringify({ items: [
+      { text: '250 g Linsen', qty: 250, unit: 'g', name: 'Linsen', note: null, optional: false },
+      { text: '1 Zwiebel', qty: 1, unit: 'Stk', name: 'Zwiebel', note: null, optional: false }] }) } };
+  });
+  const r = ok(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'https://rezepte.example.org/ohne-daten' }));
+  assert.deepStrictEqual(sent, ['rezept', 'zutaten']);
+  assert.strictEqual(r.source, 'KI aus dem Seitentext'); assert.strictEqual(r.recipe.name, 'Omas Linsensuppe');
+  assert.strictEqual(r.ingredients.find((i) => i.name === 'Zwiebel').product_id, 'P-ZWIEBEL');
+  assert.strictEqual(r.recipe.servings, null, 'Portionen nicht erfunden');
+});
+
+test('Rezept-Import: KI liefert falsche Zeilenzahl → sichere Regel-Zerlegung statt Raten', () => {
+  g.setOpenAI(() => ({ body: { output_text: JSON.stringify({ items: [{ text: 'x', qty: 1, unit: 'g', name: 'x', note: null, optional: false }] }) } }));
+  const r = ok(g.post({ action: 'import_recipe', env: 'TEST', session: F, url: 'https://rezepte.example.org/gnocchi' }));
+  assert.strictEqual(r.ingredients.length, 7);
+  assert.strictEqual(r.ingredients.find((i) => i.name === 'Knoblauch').unit, 'Zehe');
+  g.props.delete('OPENAI_API_KEY'); g.setOpenAI(null);
+});
+
+test('Importiertes Rezept speichern (mit neuem Produkt + bestätigter Zuordnung) und kochen: Bild-Spalte bleibt erhalten', () => {
+  both(M, { type: 'batch', commands: [
+    { type: 'create_product', product_id: 'P-GNOCCHI', name: 'Gnocchi', category: 'Kühlregal', base_unit: 'g' },
+    { type: 'confirm_alias', alias: 'Gnocchi (Kühlregal)', product_id: 'P-GNOCCHI', source: 'rezept' },
+    { type: 'upsert_rows', table: 'Recipe', rows: [{ recipe_id: 'R-GNOC', name: 'Ofen-Gnocchi', servings_base: 4, minutes: 30, steps: 'a\nb', source_url: 'https://rezepte.example.org/gnocchi', image_url: 'https://bilder.example.org/gnocchi.jpg', favorite: false, disliked: false }] },
+    { type: 'upsert_rows', table: 'RecipeIngredient', rows: [
+      { recipe_id: 'R-GNOC', line_no: 1, product_id: 'P-GNOCCHI', text_original: '800 g Gnocchi (Kühlregal)', qty: 800, unit: 'g', per: 'Rezept', optional: false },
+      { recipe_id: 'R-GNOC', line_no: 2, product_id: 'P-MAUL', text_original: '4 Maultaschen', qty: 4, unit: 'Stk', per: 'Rezept', optional: false },
+      { recipe_id: 'R-GNOC', line_no: 3, product_id: '', text_original: 'Salz und Pfeffer', qty: '', unit: '', per: 'Rezept', optional: false }] }] });
+  const rec = fresh().Recipe.find((x) => x.recipe_id === 'R-GNOC');
+  assert.strictEqual(rec.image_url, 'https://bilder.example.org/gnocchi.jpg');
+  assert.strictEqual(EP.resolveProduct({ tables: fresh() }, 'Gnocchi (Kühlregal)').product_id, 'P-GNOCCHI', 'Zuordnung gilt künftig überall');
+  both(F, { type: 'adjust', product_id: 'P-GNOCCHI', location_id: 'KS', qty: 1000, unit: 'g' });
+  both(F, { type: 'adjust', product_id: 'P-MAUL', location_id: 'KS', qty: 6, unit: 'Stk' });
+  both(F, { type: 'cook', recipe_id: 'R-GNOC', persons: 2, date: '2026-11-20' });
+  near(EP.totalStock({ tables: fresh() }, 'P-GNOCCHI'), 600, 'Rezept für 4, gekocht für 2 → 400 g');
+  near(EP.totalStock({ tables: fresh() }, 'P-MAUL'), 4);
+  same('nach Rezept-Import');
 });
 
 console.log(`\n${pass} bestanden, ${failCount} fehlgeschlagen`);

@@ -316,5 +316,17 @@ test('Planungsbefehle dürfen Journal/Bestand nicht anfassen; gebuchte Liste ble
   assert.strictEqual(EP.verifyLedger(s).ok, true);
 });
 
+test('Rezeptzeilen: Menge, Einheit, Zutat, Hinweis – ohne Menge nichts erfinden', () => {
+  const P = (l) => { const r = EP.parseIngredientLine(l); return [r.qty, r.unit, r.name, r.note, r.optional]; };
+  assert.deepStrictEqual(P('2 Zehen Knoblauch, fein gehackt'), [2, 'Zehe', 'Knoblauch', 'fein gehackt', false]);
+  assert.deepStrictEqual(P('1 ½ EL Olivenöl'), [1.5, 'EL', 'Olivenöl', '', false]);
+  assert.deepStrictEqual(P('Salz und Pfeffer'), [null, '', 'Salz und Pfeffer', '', false]);
+  assert.deepStrictEqual(P('1 Dose Tomaten (400 g)'), [1, 'Pkg', 'Tomaten', '400 g', false]);
+  assert.deepStrictEqual(P('1/2 Bund Petersilie, optional'), [0.5, 'Bund', 'Petersilie', 'optional', true]);
+  assert.deepStrictEqual(P('0,5 l Milch'), [0.5, 'l', 'Milch', '', false]);
+  assert.strictEqual(EP.parseIngredientLine('2-3 Zwiebel(n)').note, 'Angabe 2–3');
+  assert.strictEqual(EP.isoMinutes('PT1H20M'), 80);
+});
+
 console.log(`\n${pass} bestanden, ${failCount} fehlgeschlagen`);
 process.exit(failCount ? 1 : 0);

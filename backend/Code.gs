@@ -28,7 +28,7 @@ var EP = (function () {
     StockEvent: ['event_id', 'tx_id', 'ts', 'type', 'product_id', 'lot_id', 'location_id', 'delta_base', 'qty_after', 'source_ref', 'user', 'note'],
     Transaction: ['tx_id', 'idempotency_key', 'type', 'status', 'request_hash', 'user', 'ts', 'result_json'],
     MinStock: ['product_id', 'location_id', 'min_qty_base', 'updated_at'],
-    Recipe: ['recipe_id', 'name', 'category', 'servings_base', 'minutes', 'steps', 'source_url', 'favorite', 'disliked', 'repeat_every_days', 'notes', 'version', 'updated_at'],
+    Recipe: ['recipe_id', 'name', 'category', 'servings_base', 'minutes', 'steps', 'source_url', 'favorite', 'disliked', 'repeat_every_days', 'notes', 'version', 'updated_at', 'image_url'],
     RecipeIngredient: ['recipe_id', 'line_no', 'product_id', 'text_original', 'qty', 'unit', 'per', 'optional', 'note'],
     CookEvent: ['cook_id', 'recipe_id', 'date', 'persons', 'tx_id', 'user', 'ts'],
     MealPlan: ['week_start', 'status', 'confirmed_at', 'confirmed_by'],
@@ -75,6 +75,25 @@ var EP = (function () {
     return function (prefix) {
       var s = '';
       for (var i = 0; i < 8; i++) s += alphabet[Math.floor(rnd() * alphabet.length)];
+      return prefix + '-' + s;
+    };
+  }
+
+  /**
+   * IDs aus dem Idempotenzschlüssel abgeleitet: Vorschau im Browser und Buchung auf dem Server
+   * erzeugen für denselben Vorgang dieselben IDs (nachvollziehbar, keine „Phantom“-IDs in der Anzeige).
+   */
+  function makeKeyedIdGen(key) {
+    var alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ', n = 0;
+    function mix(str, seed) {
+      var h = seed >>> 0;
+      for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+      h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16;
+      return h >>> 0;
+    }
+    return function (prefix) {
+      var t = String(key) + '#' + (++n), a = mix(t, 0x811c9dc5), b = mix(t, 0x9747b28c), s = '';
+      for (var i = 0; i < 8; i++) { var v = i < 4 ? (a >>> (i * 8)) : (b >>> ((i - 4) * 8)); s += alphabet[v & 31]; }
       return prefix + '-' + s;
     };
   }
@@ -241,6 +260,7 @@ var EP = (function () {
     this.store = store;
     this.now = (opts && opts.now) || function () { return new Date().toISOString(); };
     this.idGen = (opts && opts.idGen) || makeIdGen();
+    this.keyedIds = !!(opts && opts.keyedIds);
   }
 
   /**
@@ -262,6 +282,7 @@ var EP = (function () {
         return prev;
       }
     }
+    if (this.keyedIds) this.idGen = makeKeyedIdGen(ctx.idempotencyKey);
     // Auf Kopie arbeiten → atomar
     var work = deepCopy(this.store);
     var before = snapshotCounts(this.store);
@@ -784,6 +805,59 @@ var EP = (function () {
     return items;
   }
 
+  // ------------------------------------------------------- Rezeptzutaten (Import)
+  var RECIPE_UNITS = {
+    el: 'EL', 'eßl': 'EL', 'essl': 'EL', 'esslöffel': 'EL', 'eßlöffel': 'EL', tl: 'TL', 'teel': 'TL', 'teelöffel': 'TL',
+    prise: 'Prise', prisen: 'Prise', msp: 'Msp', messerspitze: 'Msp', bund: 'Bund', zehe: 'Zehe', zehen: 'Zehe',
+    scheibe: 'Scheibe', scheiben: 'Scheibe', tasse: 'Tasse', tassen: 'Tasse', handvoll: 'Handvoll', schuss: 'Schuss', spritzer: 'Schuss',
+    'päckchen': 'Pkg', 'pkt': 'Pkg', beutel: 'Pkg', knolle: 'Knolle', stange: 'Stange', stangen: 'Stange', zweig: 'Zweig', zweige: 'Zweig',
+    blatt: 'Blatt', 'blätter': 'Blatt', tropfen: 'Tropfen', 'würfel': 'Würfel', kopf: 'Kopf'
+  };
+  var FRACTIONS = { '½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1 / 3, '⅔': 2 / 3, '⅛': 0.125 };
+  /**
+   * Zerlegt eine Zutatenzeile („2 Zehen Knoblauch, fein gehackt“) in Menge, Einheit, Zutat, Hinweis.
+   * Erfindet nichts: ohne erkennbare Menge ist qty null („Salz und Pfeffer“).
+   */
+  function parseIngredientLine(line) {
+    var orig = String(line || '').replace(/\s+/g, ' ').trim();
+    var s = orig.replace(/^[-•*·]\s*/, '');
+    var out = { text: orig, qty: null, unit: '', name: '', note: '', optional: false, range: '' };
+    if (/\b(optional|nach belieben|nach geschmack|n\.\s*b\.|evtl\.?|eventuell)\b/i.test(s)) out.optional = true;
+    s = s.replace(/^(ca\.?|etwa|circa|gut|knapp)\s+/i, '');
+    Object.keys(FRACTIONS).forEach(function (f) { s = s.replace(new RegExp('(\\d)\\s*' + f), function (m, d) { return String(Number(d) + FRACTIONS[f]); }).replace(f, String(FRACTIONS[f])); });
+    var m = /^(\d+(?:[.,]\d+)?)(?:\s+(\d+)\/(\d+))?(?:\s*\/\s*(\d+))?(?:\s*[-–]\s*(\d+(?:[.,]\d+)?))?\s*/.exec(s);
+    if (m) {
+      var q = Number(m[1].replace(',', '.'));
+      if (m[2]) q += Number(m[2]) / Number(m[3]);
+      if (m[4]) q = q / Number(m[4]);
+      if (m[5]) out.range = m[1] + '–' + m[5];
+      out.qty = Math.round(q * 1000) / 1000;
+      s = s.slice(m[0].length);
+      var w = /^([A-Za-zÄÖÜäöüß]+\.?)(?=\s|$)/.exec(s);
+      if (w) {
+        var k = w[1].toLowerCase().replace(/\.$/, '');
+        var u = RECIPE_UNITS[k] || (UNIT_ALIASES[k] && ['x', 'st'].indexOf(k) < 0 ? UNIT_ALIASES[k] : '');
+        if (u) { out.unit = u; s = s.slice(w[0].length).trim(); }
+      }
+    }
+    // Hinweise: Klammern und alles nach dem ersten Komma
+    var notes = [];
+    s = s.replace(/\(([^)]*)\)/g, function (all, inner) { if (/^(n|en|e|s|er)$/i.test(inner.trim())) return ''; notes.push(inner.trim()); return ''; });
+    var c = s.indexOf(',');
+    if (c >= 0) { notes.push(s.slice(c + 1).trim()); s = s.slice(0, c); }
+    out.name = s.replace(/\s+/g, ' ').replace(/^(von|vom)\s+/i, '').trim();
+    out.note = notes.filter(Boolean).join(', ');
+    if (out.range) out.note = (out.note ? out.note + ', ' : '') + 'Angabe ' + out.range;
+    if (!out.name) out.name = orig;
+    return out;
+  }
+  /** ISO-8601-Dauer (PT1H20M) → Minuten, sonst null */
+  function isoMinutes(d) {
+    var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?/i.exec(String(d || ''));
+    if (!m || !(m[1] || m[2] || m[3])) return null;
+    return (Number(m[1] || 0) * 24 + Number(m[2] || 0)) * 60 + Number(m[3] || 0);
+  }
+
   // ------------------------------------------------------------ Sprache
   var NUMWORDS = { ein: 1, eins: 1, eine: 1, einen: 1, einem: 1, einer: 1, zwei: 2, drei: 3, vier: 4, 'fünf': 5, fuenf: 5, sechs: 6, sieben: 7, acht: 8, neun: 9, zehn: 10, elf: 11, 'zwölf': 12, zwoelf: 12, halbe: 0.5, halb: 0.5 };
   var MONTHS = { januar: 1, februar: 2, 'märz': 3, maerz: 3, april: 4, mai: 5, juni: 6, juli: 7, august: 8, september: 9, oktober: 10, november: 11, dezember: 12 };
@@ -889,11 +963,11 @@ var EP = (function () {
 
   return {
     isAllowed: isAllowed, requestAccess: requestAccess, decideAccess: decideAccess, verifyLedger: verifyLedger,
-    SCHEMA: SCHEMA, EDITABLE: EDITABLE, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen,
+    SCHEMA: SCHEMA, EDITABLE: EDITABLE, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen, makeKeyedIdGen: makeKeyedIdGen,
     normalizeName: normalizeName, resolveProduct: resolveProduct, normUnit: normUnit, toBase: toBase,
     totalStock: totalStock, lotsOf: lotsOf, fefoSort: fefoSort,
     Engine: Engine, previewCook: previewCook, computeShoppingList: computeShoppingList,
-    receiptFingerprint: receiptFingerprint, parseVoice: parseVoice, stableHash: stableHash
+    receiptFingerprint: receiptFingerprint, parseVoice: parseVoice, stableHash: stableHash, parseIngredientLine: parseIngredientLine, isoMinutes: isoMinutes
   };
 })();
 
@@ -911,7 +985,7 @@ if (typeof module !== 'undefined' && module.exports) module.exports = EP;
  *  - Zugriff nur für den Besitzer und vom Besitzer freigegebene Personen.
  *  - Alle Änderungen laufen über die Fachlogik (EP.Engine) unter einer Sperre, mit Idempotenzschlüssel.
  */
-var TISCH_VERSION = '1.0.0';
+var TISCH_VERSION = '1.1.0';
 var TISCH_SHEETS = {
   TEST: '1CyqvAVa_wVgL0FzhebN372SBPn6N3RcbiglVgu8pym0',
   PROD: '1QF1rurB4iaa4ckmY7zY5QFc5un06YkoQNHLhgztrBcI'
@@ -936,8 +1010,11 @@ function doPost(e) {
   var req;
   try { req = JSON.parse((e && e.postData && e.postData.contents) || '{}'); }
   catch (x) { return tischJson({ ok: false, code: 'BAD_REQUEST', message: 'Anfrage nicht lesbar' }); }
-  try { return tischJson(tischHandle(req)); }
-  catch (err) { return tischJson(tischErrorOut(err)); }
+  var t0 = Date.now(), out;
+  try { out = tischHandle(req); }
+  catch (err) { out = tischErrorOut(err); }
+  out.ms = Date.now() - t0;
+  return tischJson(out);
 }
 
 function tischJson(obj) {
@@ -985,32 +1062,38 @@ function tischHandle(req) {
     });
   }
 
-  // Ab hier nur mit Freigabe
-  var gate = tischWithLock(function () { var db = tischLoad(env, ['User']); tischEnsureOwner(db, owner); tischSave(db); return tischAccess(db, who.email, owner); });
-  if (!gate.allowed) tischFail('NO_ACCESS', gate.status === 'abgelehnt' ? 'Zugang wurde abgelehnt' : gate.status === 'angefragt' ? 'Zugang ist angefragt, aber noch nicht freigegeben' : 'Kein Zugang – bitte Zugang anfragen');
+  // Ab hier nur mit Freigabe. Zugang wird im selben Lesevorgang geprüft wie die eigentliche Aktion (eine Tabellenrunde).
+  function gate(db) {
+    tischEnsureOwner(db, owner);
+    var a = tischAccess(db, who.email, owner);
+    if (!a.allowed) tischFail('NO_ACCESS', a.status === 'abgelehnt' ? 'Zugang wurde abgelehnt' : a.status === 'angefragt' ? 'Zugang ist angefragt, aber noch nicht freigegeben' : 'Kein Zugang – bitte Zugang anfragen');
+  }
 
   switch (req.action) {
     case 'bootstrap': {
       var db0 = tischLoad(env);
+      gate(db0);
       var t = {};
       Object.keys(db0.store.tables).forEach(function (k) { if (k !== 'Transaction') t[k] = db0.store.tables[k]; });
-      return { ok: true, env: env, tables: t, rev: tischRev(env), owner: isOwner, email: who.email };
+      return { ok: true, env: env, tables: t, rev: tischRev(env), owner: isOwner, email: who.email, fast: !!tischFast() };
     }
     case 'exec': {
       if (!req.command || !req.key) tischFail('BAD_REQUEST', 'Befehl oder Schlüssel fehlt');
       return tischWithLock(function () {
         var db = tischLoad(env);
-        var eng = new EP.Engine(db.store, { now: tischNow });
+        gate(db);
+        var eng = new EP.Engine(db.store, { now: tischNow, keyedIds: true });
         var result = eng.execute(req.command, { idempotencyKey: String(req.key), user: who.email });
         var changed = tischSave(db);
         var out = {};
-        changed.forEach(function (k) { if (k !== 'Transaction') out[k] = db.store.tables[k]; });
-        return { ok: true, result: result, tables: out, rev: tischRev(env) };
+        changed.forEach(function (k) { if (k !== 'Transaction' && k !== 'User') out[k] = db.store.tables[k]; });
+        return { ok: true, result: result, tables: out, rev: tischRev(env), fast: !!tischFast() };
       });
     }
     case 'users': {
       if (!isOwner) tischFail('FORBIDDEN', 'Nur der Besitzer');
-      return { ok: true, users: tischLoad(env, ['User']).store.tables.User };
+      var dbu = tischLoad(env, ['User']); tischEnsureOwner(dbu, owner);
+      return { ok: true, users: dbu.store.tables.User };
     }
     case 'decide_access': {
       if (!isOwner) tischFail('FORBIDDEN', 'Nur der Besitzer darf freigeben');
@@ -1023,12 +1106,19 @@ function tischHandle(req) {
         return { ok: true, status: r.status, users: db.store.tables.User };
       });
     }
-    case 'ai_status':
-      return { ok: true, configured: !!tischProps().getProperty('OPENAI_API_KEY'), transcribe_model: tischProp('OPENAI_TRANSCRIBE_MODEL'), text_model: tischProp('OPENAI_TEXT_MODEL') };
+    case 'ai_status': {
+      gate(tischLoad(env, ['User']));
+      return { ok: true, configured: !!tischProps().getProperty('OPENAI_API_KEY'), transcribe_model: tischProp('OPENAI_TRANSCRIBE_MODEL'), text_model: tischProp('OPENAI_TEXT_MODEL'), fast: !!tischFast() };
+    }
     case 'transcribe':
-      return tischTranscribe(env, req);
     case 'interpret':
-      return tischInterpret(env, req);
+    case 'import_recipe': {
+      var dba = tischLoad(env, ['User', 'Product', 'ProductAlias', 'PackageProfile', 'UnitConversion']);
+      gate(dba);
+      if (req.action === 'transcribe') return tischTranscribe(env, req, dba);
+      if (req.action === 'interpret') return tischInterpret(env, req, dba);
+      return tischImportRecipe(env, req, dba);
+    }
     default:
       tischFail('UNKNOWN_ACTION', 'Unbekannte Aktion: ' + req.action);
   }
@@ -1114,6 +1204,11 @@ function tischMailOwner(owner, who, env) {
 }
 
 // ===================================================================== Tabellen lesen/schreiben
+// Schneller Weg: Erweiterter Dienst „Google Sheets API“ (im Editor unter Dienste hinzufügen) –
+// liest alle Blätter mit EINEM Aufruf und schreibt alle Änderungen mit EINEM Aufruf.
+// Ohne den Dienst läuft der langsamere Weg über SpreadsheetApp (Blatt für Blatt).
+function tischFast() { return typeof Sheets !== 'undefined' && Sheets.Spreadsheets && Sheets.Spreadsheets.Values; }
+
 function tischOpen(env) {
   var id = TISCH_SHEETS[env];
   if (!id) tischFail('CONFIG', 'Unbekannte Umgebung');
@@ -1124,33 +1219,52 @@ function tischOpen(env) {
   return ss;
 }
 
-/** Lädt alle Tabellen in einen Store. Merkt sich die gelesenen Zellen, um nur Geändertes zu schreiben. */
+/** Lädt Tabellen in einen Store. Merkt sich die gelesenen Zellen, um nur Geändertes zu schreiben. */
 function tischLoad(env, only) {
-  var ss = tischOpen(env);
+  var names = only || Object.keys(EP.SCHEMA);
+  var id = TISCH_SHEETS[env];
+  if (!id) tischFail('CONFIG', 'Unbekannte Umgebung');
+  var grids = {}, ss = null, lastRow = {};
+  if (tischFast()) {
+    var res;
+    try {
+      res = Sheets.Spreadsheets.Values.batchGet(id, { ranges: ['_Info!B1'].concat(names), valueRenderOption: 'UNFORMATTED_VALUE', dateTimeRenderOption: 'FORMATTED_STRING' });
+    } catch (e) { tischFail('SCHEMA', 'Tabelle nicht lesbar (fehlt ein Blatt?): ' + e.message); }
+    var vr = res.valueRanges || [];
+    var mark = vr[0] && vr[0].values && vr[0].values[0] ? String(vr[0].values[0][0]).trim() : '';
+    if (mark !== env) tischFail('SAFETY', 'Sicherheitsstopp: Tabelle ist nicht als ' + env + ' gekennzeichnet');
+    names.forEach(function (n, i) { grids[n] = (vr[i + 1] && vr[i + 1].values) || []; });
+  } else {
+    ss = tischOpen(env);
+    names.forEach(function (n) {
+      var sh = ss.getSheetByName(n);
+      if (!sh) tischFail('SCHEMA', 'Blatt ' + n + ' fehlt');
+      grids[n] = sh.getDataRange().getValues();
+    });
+  }
   var store = EP.newStore(), raw = {};
-  (only || Object.keys(EP.SCHEMA)).forEach(function (name) {
-    var cols = EP.SCHEMA[name];
-    var sh = ss.getSheetByName(name);
-    if (!sh) tischFail('SCHEMA', 'Blatt ' + name + ' fehlt');
-    var values = sh.getDataRange().getValues();
+  names.forEach(function (name) {
+    var cols = EP.SCHEMA[name], values = grids[name];
     var head = (values[0] || []).map(function (h) { return String(h).trim(); });
     for (var i = 0; i < cols.length; i++) if (head[i] !== cols[i]) tischFail('SCHEMA', 'Blatt ' + name + ': Spalte ' + (i + 1) + ' muss „' + cols[i] + '“ heißen');
     var rows = [];
     for (var r = 1; r < values.length; r++) {
-      var line = values[r].slice(0, cols.length);
-      if (line.every(function (v) { return v === '' || v === null; })) continue;
+      var line = (values[r] || []).slice(0, cols.length);
+      if (line.every(function (v) { return v === '' || v === null || v === undefined; })) continue;
       var obj = {};
-      cols.forEach(function (c, j) { obj[c] = tischFromCell(c, line[j]); });
+      cols.forEach(function (c, j) { obj[c] = tischFromCell(c, line[j] === undefined ? '' : line[j]); });
       rows.push(obj);
     }
     store.tables[name] = rows;
     raw[name] = rows.map(function (o) { return tischToCells(cols, o); });
+    lastRow[name] = Math.max(values.length, 1); // letzte belegte Zeile (1 = nur Kopfzeile)
   });
-  return { env: env, ss: ss, store: store, raw: raw };
+  return { env: env, id: id, ss: ss, store: store, raw: raw, lastRow: lastRow };
 }
 
 function tischFromCell(col, v) {
   if (Object.prototype.toString.call(v) === '[object Date]') v = Utilities.formatDate(v, Session.getScriptTimeZone(), (v.getHours() || v.getMinutes()) ? "yyyy-MM-dd'T'HH:mm:ss" : 'yyyy-MM-dd');
+  if (typeof v === 'string') { var d = /^(\d{1,2})\.(\d{1,2})\.(\d{4})$/.exec(v.trim()); if (d) v = d[3] + '-' + ('0' + d[2]).slice(-2) + '-' + ('0' + d[1]).slice(-2); }
   if (TISCH_NUM[col]) { if (v === '' || v === null) return null; var n = Number(String(v).replace(',', '.')); return isNaN(n) ? null : n; }
   if (TISCH_BOOL[col]) { if (v === true || String(v).toUpperCase() === 'TRUE') return true; if (v === false || String(v).toUpperCase() === 'FALSE') return false; return ''; }
   return v === null ? '' : String(v);
@@ -1162,34 +1276,48 @@ function tischToCell(col, v) {
   return String(v);
 }
 function tischToCells(cols, o) { return cols.map(function (c) { return tischToCell(c, o[c]); }); }
+function tischColLetter(n) { var s = ''; while (n > 0) { var m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
 
-/** Schreibt geänderte Tabellen. Rückgabe: Namen der geänderten Tabellen. Erhöht die Revision. */
+/** Schreibt geänderte Tabellen (Journal nur anhängen). Rückgabe: Namen der geänderten Tabellen. Erhöht die Revision. */
 function tischSave(db) {
-  var changed = [];
+  var changed = [], data = [];
   Object.keys(db.raw).forEach(function (name) {
     var cols = EP.SCHEMA[name];
     var now = db.store.tables[name].map(function (o) { return tischToCells(cols, o); });
     var before = db.raw[name];
     if (JSON.stringify(now) === JSON.stringify(before)) return;
-    var sh = db.ss.getSheetByName(name);
-    var prefixSame = TISCH_APPEND_ONLY[name] && now.length >= before.length &&
-      JSON.stringify(now.slice(0, before.length)) === JSON.stringify(before);
-    if (prefixSame) {
-      var add = now.slice(before.length);
-      var rng = sh.getRange(Math.max(sh.getLastRow(), 1) + 1, 1, add.length, cols.length); // hinter der letzten belegten Zeile, nie überschreiben
-      rng.setNumberFormat('@'); rng.setValues(add);
+    var appendOnly = TISCH_APPEND_ONLY[name] && now.length >= before.length && JSON.stringify(now.slice(0, before.length)) === JSON.stringify(before);
+    var start, rows;
+    if (appendOnly) {
+      rows = now.slice(before.length);
+      start = db.lastRow[name] + 1; // hinter der letzten belegten Zeile, nie überschreiben
     } else {
-      var last = sh.getLastRow();
-      if (last > 1) sh.getRange(2, 1, last - 1, Math.max(cols.length, sh.getLastColumn())).clearContent();
-      if (now.length) { var r2 = sh.getRange(2, 1, now.length, cols.length); r2.setNumberFormat('@'); r2.setValues(now); }
+      // ganze Tabelle neu: alte Zeilen bis zur bisher letzten belegten Zeile mit Leerzellen überschreiben
+      rows = now.slice();
+      var clearTo = db.lastRow[name] - 1;
+      while (rows.length < clearTo) rows.push(cols.map(function () { return ''; }));
+      start = 2;
     }
+    if (rows.length) data.push({ name: name, start: start, rows: rows, cols: cols.length });
     db.raw[name] = now;
+    db.lastRow[name] = appendOnly ? db.lastRow[name] + rows.length : Math.max(now.length + 1, 1);
     changed.push(name);
   });
-  if (changed.length) {
+  if (!changed.length) return changed;
+  if (tischFast()) {
+    Sheets.Spreadsheets.Values.batchUpdate({
+      valueInputOption: 'RAW',
+      data: data.map(function (d) { return { range: d.name + '!A' + d.start + ':' + tischColLetter(d.cols) + (d.start + d.rows.length - 1), values: d.rows }; })
+    }, db.id);
+  } else {
+    var ss = db.ss || tischOpen(db.env);
+    data.forEach(function (d) {
+      var rng = ss.getSheetByName(d.name).getRange(d.start, 1, d.rows.length, d.cols);
+      rng.setNumberFormat('@'); rng.setValues(d.rows);
+    });
     SpreadsheetApp.flush();
-    var p = tischProps(); p.setProperty('REV_' + db.env, String(Number(p.getProperty('REV_' + db.env) || 0) + 1));
   }
+  var p = tischProps(); p.setProperty('REV_' + db.env, String(Number(p.getProperty('REV_' + db.env) || 0) + 1));
   return changed;
 }
 
@@ -1209,7 +1337,7 @@ function tischOpenAI(path, options) {
   return body;
 }
 
-function tischTranscribe(env, req) {
+function tischTranscribe(env, req, db) {
   if (!req.audio) tischFail('BAD_REQUEST', 'Keine Aufnahme');
   var bytes = Utilities.base64Decode(req.audio);
   if (bytes.length > 10 * 1024 * 1024) tischFail('TOO_BIG', 'Aufnahme zu lang');
@@ -1217,7 +1345,7 @@ function tischTranscribe(env, req) {
   var ext = /webm/.test(mime) ? 'webm' : /ogg/.test(mime) ? 'ogg' : /wav/.test(mime) ? 'wav' : /mpeg|mp3/.test(mime) ? 'mp3' : 'm4a';
   var blob = Utilities.newBlob(bytes, mime, 'diktat.' + ext);
   // Produktnamen als Hinweis verbessern die Erkennung (z. B. „Maasdamer“)
-  var names = tischLoad(env, ['Product']).store.tables.Product.map(function (p) { return p.name; }).slice(0, 120).join(', ');
+  var names = (db || tischLoad(env, ['Product'])).store.tables.Product.map(function (p) { return p.name; }).slice(0, 120).join(', ');
   var body = tischOpenAI('/v1/audio/transcriptions', {
     method: 'post',
     payload: { file: blob, model: tischProp('OPENAI_TRANSCRIBE_MODEL'), language: 'de', response_format: 'json', prompt: 'Einkauf und Vorrat einer Familie. Produkte: ' + names }
@@ -1250,10 +1378,10 @@ var TISCH_ACTION_SCHEMA = {
   }
 };
 
-function tischInterpret(env, req) {
+function tischInterpret(env, req, db0) {
   var text = String(req.text || '').trim();
   if (!text) tischFail('BAD_REQUEST', 'Kein Text');
-  var db = tischLoad(env, ['Product']);
+  var db = db0 || tischLoad(env, ['Product']);
   var names = db.store.tables.Product.map(function (p) { return p.name; }).slice(0, 200).join(', ');
   var today = String(req.today || tischNow()).slice(0, 10);
   var sys = 'Du zerlegst gesprochene Sätze einer Familie über ihren Lebensmittelvorrat in einzelne Aktionen. Heute ist ' + today + '. ' +
@@ -1294,6 +1422,139 @@ function tischOutputText(body) {
   return parts.join('');
 }
 
+// ===================================================================== Rezept-Import
+/**
+ * Rezept aus Link (oder eingefügtem Text) holen und zur PRÜFUNG zurückgeben – speichert nichts.
+ * 1) strukturierte Rezeptdaten der Seite (schema.org/Recipe als JSON-LD, z. B. Chefkoch)
+ * 2) sonst KI (falls eingerichtet) aus dem Seitentext
+ * Zutaten: KI zerlegt Mengen/Einheiten (falls eingerichtet), sonst Regeln; Zuordnung zu Produkten über den Namensabgleich.
+ */
+function tischImportRecipe(env, req, db) {
+  var url = String(req.url || '').trim(), text = String(req.text || '').trim(), raw = null, source = '';
+  if (url) {
+    if (!/^https?:\/\/[^\s]+$/i.test(url)) tischFail('BAD_REQUEST', 'Bitte einen vollständigen Link (https://…) angeben');
+    var res;
+    try { res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, followRedirects: true, headers: { 'User-Agent': 'Mozilla/5.0 (Tischlein Rezeptimport)', 'Accept-Language': 'de-DE,de;q=0.9' } }); }
+    catch (e) { tischFail('FETCH', 'Seite nicht erreichbar: ' + e.message); }
+    if (res.getResponseCode() >= 400) tischFail('FETCH', 'Seite meldet Fehler ' + res.getResponseCode());
+    var html = res.getContentText().slice(0, 3000000);
+    raw = tischRecipeFromJsonLd(html);
+    if (raw) source = 'Rezeptdaten der Seite';
+    else if (tischProps().getProperty('OPENAI_API_KEY')) { raw = tischRecipeFromAI(tischHtmlToText(html), db); source = 'KI aus dem Seitentext'; }
+    else tischFail('NO_RECIPE', 'Auf der Seite stehen keine lesbaren Rezeptdaten. Mit eingerichteter KI kann ich den Text auswerten.');
+  } else if (text) {
+    if (tischProps().getProperty('OPENAI_API_KEY')) { raw = tischRecipeFromAI(text.slice(0, 20000), db); source = 'KI aus dem Text'; }
+    else {
+      var lines = text.split(/\n+/).map(function (l) { return l.trim(); }).filter(Boolean);
+      raw = { name: lines[0] || 'Neues Rezept', ingredients: lines.slice(1), steps: [], servings: null, minutes: null, image: '', category: '' };
+      source = 'Text (erste Zeile = Name, Rest = Zutaten)';
+    }
+  } else tischFail('BAD_REQUEST', 'Link oder Text fehlt');
+  if (!raw || !raw.name || !(raw.ingredients || []).length) tischFail('NO_RECIPE', 'Kein Rezept mit Zutaten erkannt');
+
+  var parsed = null;
+  if (tischProps().getProperty('OPENAI_API_KEY')) { try { parsed = tischIngredientsAI(raw.ingredients, db); } catch (e) { parsed = null; } }
+  if (!parsed) parsed = raw.ingredients.map(function (l) { return EP.parseIngredientLine(l); });
+
+  var ings = parsed.map(function (x, i) {
+    var r = EP.resolveProduct(db.store, x.name);
+    var pid = r.status === 'resolved' ? r.product_id : '';
+    var unit = x.unit || '';
+    if (pid && !unit && x.qty != null) unit = tischBaseUnit(db, pid);
+    var conv = pid && x.qty != null ? EP.toBase(db.store, pid, x.qty, unit || tischBaseUnit(db, pid)) : null;
+    return {
+      line_no: i + 1, text_original: x.text || raw.ingredients[i], name: x.name, qty: x.qty, unit: unit, note: x.note || '', optional: !!x.optional,
+      product_id: pid, candidates: r.status === 'suggestion' ? r.candidates.slice(0, 4) : [],
+      check: !pid ? 'Produkt zuordnen' : x.qty == null ? 'ohne Menge – wird beim Kochen nicht abgebucht' : conv && !conv.ok ? conv.reason : ''
+    };
+  });
+  return { ok: true, source: source, recipe: {
+    name: String(raw.name).trim().slice(0, 120), servings: raw.servings || null, minutes: raw.minutes || null,
+    steps: (raw.steps || []).join('\n'), source_url: url, image_url: raw.image || '', category: raw.category || ''
+  }, ingredients: ings };
+}
+function tischBaseUnit(db, pid) { var p = db.store.tables.Product.filter(function (x) { return x.product_id === pid; })[0]; return p ? p.base_unit : ''; }
+
+function tischRecipeFromJsonLd(html) {
+  var re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, m, found = null;
+  function walk(o) {
+    if (!o || found) return;
+    if (Array.isArray(o)) { o.forEach(walk); return; }
+    if (typeof o !== 'object') return;
+    var t = o['@type']; if (Array.isArray(t) ? t.indexOf('Recipe') >= 0 : t === 'Recipe') { found = o; return; }
+    if (o['@graph']) walk(o['@graph']);
+  }
+  while ((m = re.exec(html)) && !found) { try { walk(JSON.parse(m[1].trim())); } catch (e) { /* ungültiges JSON auf der Seite überspringen */ } }
+  if (!found) return null;
+  function str(v) { return v == null ? '' : tischDecode(String(v)).replace(/\s+/g, ' ').trim(); }
+  var steps = [];
+  (function addSteps(v) {
+    if (!v) return;
+    if (typeof v === 'string') { v.split(/\n+/).forEach(function (x) { if (str(x)) steps.push(str(x)); }); return; }
+    if (Array.isArray(v)) { v.forEach(addSteps); return; }
+    if (v.itemListElement) { addSteps(v.itemListElement); return; }
+    if (v.text) steps.push(str(v.text)); else if (v.name) steps.push(str(v.name));
+  })(found.recipeInstructions);
+  var y = found.recipeYield; if (Array.isArray(y)) y = y[0];
+  var servings = y != null ? Number((String(y).match(/\d+/) || [])[0]) || null : null;
+  var minutes = EP.isoMinutes(found.totalTime) || ((EP.isoMinutes(found.prepTime) || 0) + (EP.isoMinutes(found.cookTime) || 0)) || null;
+  var img = found.image; if (Array.isArray(img)) img = img[0]; if (img && typeof img === 'object') img = img.url || img.contentUrl;
+  var cat = found.recipeCategory; if (Array.isArray(cat)) cat = cat[0];
+  return {
+    name: str(found.name), servings: servings, minutes: minutes, steps: steps,
+    ingredients: [].concat(found.recipeIngredient || found.ingredients || []).map(str).filter(Boolean),
+    image: /^https:\/\//.test(String(img || '')) ? String(img) : '', category: str(cat)
+  };
+}
+function tischDecode(s) {
+  return s.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&#(\d+);/g, function (a, n) { return String.fromCharCode(Number(n)); });
+}
+function tischHtmlToText(html) {
+  return tischDecode(html.replace(/<(script|style|noscript|svg|nav|footer|header)[\s\S]*?<\/\1>/gi, ' ')).replace(/\s+/g, ' ').trim().slice(0, 15000);
+}
+
+var TISCH_RECIPE_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['name', 'servings', 'minutes', 'ingredients', 'steps', 'category'],
+  properties: {
+    name: { type: 'string' }, servings: { type: ['number', 'null'] }, minutes: { type: ['number', 'null'] },
+    ingredients: { type: 'array', items: { type: 'string' }, description: 'Zutatenzeilen wörtlich wie im Rezept, inklusive Menge und Einheit' },
+    steps: { type: 'array', items: { type: 'string' } }, category: { type: ['string', 'null'] }
+  }
+};
+function tischRecipeFromAI(text, db) {
+  var body = tischOpenAI('/v1/responses', { method: 'post', contentType: 'application/json', payload: JSON.stringify({
+    model: tischProp('OPENAI_TEXT_MODEL'),
+    input: [{ role: 'system', content: 'Lies aus dem Text genau EIN Rezept aus. Übernimm Zutaten und Schritte wörtlich, erfinde nichts. Fehlende Angaben sind null bzw. leer. Wenn kein Rezept enthalten ist, gib name leer zurück.' }, { role: 'user', content: text }],
+    text: { format: { type: 'json_schema', name: 'rezept', strict: true, schema: TISCH_RECIPE_SCHEMA } }
+  }) });
+  var r = JSON.parse(tischOutputText(body));
+  if (!r.name) return null;
+  return { name: r.name, servings: r.servings, minutes: r.minutes, ingredients: r.ingredients || [], steps: r.steps || [], image: '', category: r.category || '' };
+}
+
+var TISCH_ING_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['items'],
+  properties: { items: { type: 'array', items: { type: 'object', additionalProperties: false, required: ['text', 'qty', 'unit', 'name', 'note', 'optional'], properties: {
+    text: { type: 'string' }, qty: { type: ['number', 'null'] },
+    unit: { type: ['string', 'null'], enum: ['g', 'kg', 'ml', 'l', 'Stk', 'Pkg', 'EL', 'TL', 'Prise', 'Msp', 'Bund', 'Zehe', 'Scheibe', 'Tasse', 'Handvoll', 'Schuss', 'Knolle', 'Stange', 'Zweig', 'Blatt', 'Würfel', 'Kopf', null] },
+    name: { type: 'string', description: 'Lebensmittel wie man es einkauft, Einzahl, ohne Zubereitungshinweis' }, note: { type: ['string', 'null'] }, optional: { type: 'boolean' }
+  } } } }
+};
+function tischIngredientsAI(lines, db) {
+  var names = db.store.tables.Product.map(function (p) { return p.name; }).slice(0, 200).join(', ');
+  var body = tischOpenAI('/v1/responses', { method: 'post', contentType: 'application/json', payload: JSON.stringify({
+    model: tischProp('OPENAI_TEXT_MODEL'),
+    input: [{ role: 'system', content: 'Zerlege jede Zutatenzeile in Menge, Einheit, Lebensmittel und Hinweis. Genau ein Eintrag je Zeile, gleiche Reihenfolge, text = Originalzeile. ' +
+      'Keine Menge erfinden: „Salz“, „etwas Öl“ → qty null. Bei Spannen („2–3“) die kleinere Zahl und die Spanne als Hinweis. Dose/Becher/Päckchen/Glas → Pkg. ' +
+      'Verwende für name möglichst die Schreibweise dieser Haushaltsprodukte, wenn es dasselbe Lebensmittel ist: ' + names }, { role: 'user', content: lines.join('\n') }],
+    text: { format: { type: 'json_schema', name: 'zutaten', strict: true, schema: TISCH_ING_SCHEMA } }
+  }) });
+  var items = JSON.parse(tischOutputText(body)).items || [];
+  if (items.length !== lines.length) return null; // Zuordnung Zeile↔Ergebnis nicht sicher → Regeln verwenden
+  return items.map(function (x, i) { return { text: lines[i], qty: typeof x.qty === 'number' ? x.qty : null, unit: x.unit || '', name: x.name || lines[i], note: x.note || '', optional: !!x.optional }; });
+}
+
 // ===================================================================== Einrichtung (einmal im Editor ausführen)
 /** Prüft Tabellen, Besitzer und Skripteigenschaften und schreibt einen Bericht ins Protokoll. Ändert keine Daten. */
 function einrichtungPruefen() {
@@ -1307,6 +1568,7 @@ function einrichtungPruefen() {
   log.push('GOOGLE_CLIENT_ID: ' + (p.getProperty('GOOGLE_CLIENT_ID') ? 'gesetzt' : 'FEHLT'));
   log.push('OPENAI_API_KEY: ' + (p.getProperty('OPENAI_API_KEY') ? 'gesetzt' : 'nicht gesetzt (KI aus)'));
   log.push('Modelle: ' + tischProp('OPENAI_TRANSCRIBE_MODEL') + ' / ' + tischProp('OPENAI_TEXT_MODEL'));
+  log.push('Schneller Tabellenzugriff (Dienst „Google Sheets API“): ' + (tischFast() ? 'aktiv' : 'NICHT aktiv – im Editor links bei „Dienste“ hinzufügen'));
   Logger.log(log.join('\n'));
   return log;
 }

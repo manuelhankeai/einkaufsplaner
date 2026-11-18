@@ -62,9 +62,17 @@ Kosten (Preise laut OpenAI, Stand November 2026): Verschriftung `gpt-transcribe`
 Ein Sprachbefehl von etwa 10 Sekunden kostet damit rund 0,1 Cent; bei 10 Befehlen am Tag etwa 0,30 € im Monat.
 Modelle lassen sich über die Skripteigenschaften `OPENAI_TRANSCRIBE_MODEL` und `OPENAI_TEXT_MODEL` ändern.
 
+## Schneller Tabellenzugriff einschalten (einmalig, wichtig fürs Tempo)
+
+Im Apps-Script-Editor links bei **Dienste** auf **+** → **Google Sheets API** wählen → **Hinzufügen** (Kennung `Sheets` so lassen).
+Damit liest und schreibt das Backend alle Blätter mit je einem Aufruf statt Blatt für Blatt.
+`einrichtungPruefen` zeigt danach: `Schneller Tabellenzugriff …: aktiv`. (Falls Google erneut nach Berechtigungen fragt: zulassen.)
+
 ## Bei neuen Versionen des Backends
 
-`Code.gs` wieder komplett ersetzen → Speichern → **Bereitstellen → Bereitstellungen verwalten** → Stift → Version: **Neue Version** → Bereitstellen. Die Adresse bleibt gleich.
+1. `Code.gs` komplett ersetzen durch https://raw.githubusercontent.com/manuelhankeai/einkaufsplaner/main/backend/Code.gs → Speichern.
+2. **Bereitstellen → Bereitstellungen verwalten** → Stift → Version: **Neue Version** → Bereitstellen. Die Adresse bleibt gleich.
+3. Kontrolle: Backend-Adresse im Browser öffnen → dort steht die Versionsnummer (aktuell `1.1.0`).
 
 ## Prüfungen (für Entwicklung)
 

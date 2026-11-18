@@ -6,5 +6,6 @@ pruefe() { titel="$1"; shift; out=$("$@" 2>&1) || { echo "== $titel: FEHLER"; ec
 pruefe "Fachlogik"           node tests/run.js
 pruefe "Wochen-Testlauf"     node tests/szenarien.js
 pruefe "Backend bauen"       node tools/build-backend.js
-pruefe "Backend"             node tests/backend.js
+pruefe "Backend (langsamer Weg)" node tests/backend.js
+pruefe "Backend (Sheets-Dienst)" env TISCH_FAST=1 node tests/backend.js
 pruefe "Klicktest (Browser)" python3 tests/e2e.py

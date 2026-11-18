@@ -25,7 +25,7 @@ var EP = (function () {
     StockEvent: ['event_id', 'tx_id', 'ts', 'type', 'product_id', 'lot_id', 'location_id', 'delta_base', 'qty_after', 'source_ref', 'user', 'note'],
     Transaction: ['tx_id', 'idempotency_key', 'type', 'status', 'request_hash', 'user', 'ts', 'result_json'],
     MinStock: ['product_id', 'location_id', 'min_qty_base', 'updated_at'],
-    Recipe: ['recipe_id', 'name', 'category', 'servings_base', 'minutes', 'steps', 'source_url', 'favorite', 'disliked', 'repeat_every_days', 'notes', 'version', 'updated_at'],
+    Recipe: ['recipe_id', 'name', 'category', 'servings_base', 'minutes', 'steps', 'source_url', 'favorite', 'disliked', 'repeat_every_days', 'notes', 'version', 'updated_at', 'image_url'],
     RecipeIngredient: ['recipe_id', 'line_no', 'product_id', 'text_original', 'qty', 'unit', 'per', 'optional', 'note'],
     CookEvent: ['cook_id', 'recipe_id', 'date', 'persons', 'tx_id', 'user', 'ts'],
     MealPlan: ['week_start', 'status', 'confirmed_at', 'confirmed_by'],
@@ -72,6 +72,25 @@ var EP = (function () {
     return function (prefix) {
       var s = '';
       for (var i = 0; i < 8; i++) s += alphabet[Math.floor(rnd() * alphabet.length)];
+      return prefix + '-' + s;
+    };
+  }
+
+  /**
+   * IDs aus dem Idempotenzschlüssel abgeleitet: Vorschau im Browser und Buchung auf dem Server
+   * erzeugen für denselben Vorgang dieselben IDs (nachvollziehbar, keine „Phantom“-IDs in der Anzeige).
+   */
+  function makeKeyedIdGen(key) {
+    var alphabet = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ', n = 0;
+    function mix(str, seed) {
+      var h = seed >>> 0;
+      for (var i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619) >>> 0; }
+      h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b) >>> 0; h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35) >>> 0; h ^= h >>> 16;
+      return h >>> 0;
+    }
+    return function (prefix) {
+      var t = String(key) + '#' + (++n), a = mix(t, 0x811c9dc5), b = mix(t, 0x9747b28c), s = '';
+      for (var i = 0; i < 8; i++) { var v = i < 4 ? (a >>> (i * 8)) : (b >>> ((i - 4) * 8)); s += alphabet[v & 31]; }
       return prefix + '-' + s;
     };
   }
@@ -238,6 +257,7 @@ var EP = (function () {
     this.store = store;
     this.now = (opts && opts.now) || function () { return new Date().toISOString(); };
     this.idGen = (opts && opts.idGen) || makeIdGen();
+    this.keyedIds = !!(opts && opts.keyedIds);
   }
 
   /**
@@ -259,6 +279,7 @@ var EP = (function () {
         return prev;
       }
     }
+    if (this.keyedIds) this.idGen = makeKeyedIdGen(ctx.idempotencyKey);
     // Auf Kopie arbeiten → atomar
     var work = deepCopy(this.store);
     var before = snapshotCounts(this.store);
@@ -781,6 +802,59 @@ var EP = (function () {
     return items;
   }
 
+  // ------------------------------------------------------- Rezeptzutaten (Import)
+  var RECIPE_UNITS = {
+    el: 'EL', 'eßl': 'EL', 'essl': 'EL', 'esslöffel': 'EL', 'eßlöffel': 'EL', tl: 'TL', 'teel': 'TL', 'teelöffel': 'TL',
+    prise: 'Prise', prisen: 'Prise', msp: 'Msp', messerspitze: 'Msp', bund: 'Bund', zehe: 'Zehe', zehen: 'Zehe',
+    scheibe: 'Scheibe', scheiben: 'Scheibe', tasse: 'Tasse', tassen: 'Tasse', handvoll: 'Handvoll', schuss: 'Schuss', spritzer: 'Schuss',
+    'päckchen': 'Pkg', 'pkt': 'Pkg', beutel: 'Pkg', knolle: 'Knolle', stange: 'Stange', stangen: 'Stange', zweig: 'Zweig', zweige: 'Zweig',
+    blatt: 'Blatt', 'blätter': 'Blatt', tropfen: 'Tropfen', 'würfel': 'Würfel', kopf: 'Kopf'
+  };
+  var FRACTIONS = { '½': 0.5, '¼': 0.25, '¾': 0.75, '⅓': 1 / 3, '⅔': 2 / 3, '⅛': 0.125 };
+  /**
+   * Zerlegt eine Zutatenzeile („2 Zehen Knoblauch, fein gehackt“) in Menge, Einheit, Zutat, Hinweis.
+   * Erfindet nichts: ohne erkennbare Menge ist qty null („Salz und Pfeffer“).
+   */
+  function parseIngredientLine(line) {
+    var orig = String(line || '').replace(/\s+/g, ' ').trim();
+    var s = orig.replace(/^[-•*·]\s*/, '');
+    var out = { text: orig, qty: null, unit: '', name: '', note: '', optional: false, range: '' };
+    if (/\b(optional|nach belieben|nach geschmack|n\.\s*b\.|evtl\.?|eventuell)\b/i.test(s)) out.optional = true;
+    s = s.replace(/^(ca\.?|etwa|circa|gut|knapp)\s+/i, '');
+    Object.keys(FRACTIONS).forEach(function (f) { s = s.replace(new RegExp('(\\d)\\s*' + f), function (m, d) { return String(Number(d) + FRACTIONS[f]); }).replace(f, String(FRACTIONS[f])); });
+    var m = /^(\d+(?:[.,]\d+)?)(?:\s+(\d+)\/(\d+))?(?:\s*\/\s*(\d+))?(?:\s*[-–]\s*(\d+(?:[.,]\d+)?))?\s*/.exec(s);
+    if (m) {
+      var q = Number(m[1].replace(',', '.'));
+      if (m[2]) q += Number(m[2]) / Number(m[3]);
+      if (m[4]) q = q / Number(m[4]);
+      if (m[5]) out.range = m[1] + '–' + m[5];
+      out.qty = Math.round(q * 1000) / 1000;
+      s = s.slice(m[0].length);
+      var w = /^([A-Za-zÄÖÜäöüß]+\.?)(?=\s|$)/.exec(s);
+      if (w) {
+        var k = w[1].toLowerCase().replace(/\.$/, '');
+        var u = RECIPE_UNITS[k] || (UNIT_ALIASES[k] && ['x', 'st'].indexOf(k) < 0 ? UNIT_ALIASES[k] : '');
+        if (u) { out.unit = u; s = s.slice(w[0].length).trim(); }
+      }
+    }
+    // Hinweise: Klammern und alles nach dem ersten Komma
+    var notes = [];
+    s = s.replace(/\(([^)]*)\)/g, function (all, inner) { if (/^(n|en|e|s|er)$/i.test(inner.trim())) return ''; notes.push(inner.trim()); return ''; });
+    var c = s.indexOf(',');
+    if (c >= 0) { notes.push(s.slice(c + 1).trim()); s = s.slice(0, c); }
+    out.name = s.replace(/\s+/g, ' ').replace(/^(von|vom)\s+/i, '').trim();
+    out.note = notes.filter(Boolean).join(', ');
+    if (out.range) out.note = (out.note ? out.note + ', ' : '') + 'Angabe ' + out.range;
+    if (!out.name) out.name = orig;
+    return out;
+  }
+  /** ISO-8601-Dauer (PT1H20M) → Minuten, sonst null */
+  function isoMinutes(d) {
+    var m = /^P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?/i.exec(String(d || ''));
+    if (!m || !(m[1] || m[2] || m[3])) return null;
+    return (Number(m[1] || 0) * 24 + Number(m[2] || 0)) * 60 + Number(m[3] || 0);
+  }
+
   // ------------------------------------------------------------ Sprache
   var NUMWORDS = { ein: 1, eins: 1, eine: 1, einen: 1, einem: 1, einer: 1, zwei: 2, drei: 3, vier: 4, 'fünf': 5, fuenf: 5, sechs: 6, sieben: 7, acht: 8, neun: 9, zehn: 10, elf: 11, 'zwölf': 12, zwoelf: 12, halbe: 0.5, halb: 0.5 };
   var MONTHS = { januar: 1, februar: 2, 'märz': 3, maerz: 3, april: 4, mai: 5, juni: 6, juli: 7, august: 8, september: 9, oktober: 10, november: 11, dezember: 12 };
@@ -886,11 +960,11 @@ var EP = (function () {
 
   return {
     isAllowed: isAllowed, requestAccess: requestAccess, decideAccess: decideAccess, verifyLedger: verifyLedger,
-    SCHEMA: SCHEMA, EDITABLE: EDITABLE, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen,
+    SCHEMA: SCHEMA, EDITABLE: EDITABLE, DomainError: DomainError, newStore: newStore, makeIdGen: makeIdGen, makeKeyedIdGen: makeKeyedIdGen,
     normalizeName: normalizeName, resolveProduct: resolveProduct, normUnit: normUnit, toBase: toBase,
     totalStock: totalStock, lotsOf: lotsOf, fefoSort: fefoSort,
     Engine: Engine, previewCook: previewCook, computeShoppingList: computeShoppingList,
-    receiptFingerprint: receiptFingerprint, parseVoice: parseVoice, stableHash: stableHash
+    receiptFingerprint: receiptFingerprint, parseVoice: parseVoice, stableHash: stableHash, parseIngredientLine: parseIngredientLine, isoMinutes: isoMinutes
   };
 })();
 
