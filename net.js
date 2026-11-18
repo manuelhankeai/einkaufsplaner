@@ -15,8 +15,21 @@ var Net = (function () {
   }
   function setConf(patch) { var c = read(CONN_KEY, {}); Object.keys(patch).forEach(function (k) { c[k] = patch[k]; }); write(CONN_KEY, c); }
   function live() { var c = conf(); return !!(c.backendUrl && c.clientId); }
-  function session() { return read(SESSION_KEY, null); }
-  function setSession(s) { write(SESSION_KEY, s); }
+  // Sitzung zusätzlich als Cookie: iOS übernimmt beim „Zum Home-Bildschirm“ die Cookies aus Safari,
+  // nicht aber den übrigen Gerätespeicher. So bleibt man nach dem Hinzufügen angemeldet.
+  var COOKIE = 'tisch_s';
+  function cookiePath() { return location.pathname.replace(/[^/]*$/, '') || '/'; }
+  function readCookie() { var m = document.cookie.match(new RegExp('(?:^|; )' + COOKIE + '=([^;]*)')); if (!m) return null; try { return JSON.parse(decodeURIComponent(m[1])); } catch (e) { return null; } }
+  function writeCookie(s) {
+    var secure = location.protocol === 'https:' ? '; Secure' : '';
+    document.cookie = COOKIE + '=' + (s ? encodeURIComponent(JSON.stringify(s)) + '; Max-Age=' + 60 * 864e2 : '; Max-Age=0') + '; Path=' + cookiePath() + '; SameSite=Strict' + secure;
+  }
+  function session() {
+    var s = read(SESSION_KEY, null);
+    if (!s) { s = readCookie(); if (s) write(SESSION_KEY, s); }
+    return s;
+  }
+  function setSession(s) { write(SESSION_KEY, s); writeCookie(s); }
 
   /** Ruft das Backend auf. Liefert immer ein Objekt {ok, …}; Netzfehler → {ok:false, code:'OFFLINE'}. */
   function call(action, body, opts) {

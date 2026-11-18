@@ -184,6 +184,8 @@ def main():
 
             def session_and_ai():
                 ctl('ai', key='sk-test')
+                assert 'tisch_s=' in wife.evaluate('document.cookie'), 'Sitzung auch als Cookie (für iPhone-Home-Bildschirm)'
+                wife.evaluate('localStorage.removeItem("tisch-session")')  # wie frisch zum Home-Bildschirm hinzugefügt: nur Cookies übernommen
                 wife.reload()
                 wife.wait_for_selector('.tabbar button', state='visible')  # ohne erneute Anmeldung
                 before = server_total('P-GURKE')
@@ -198,7 +200,7 @@ def main():
                 wait_toast(wife, 'gebucht')
                 idle(wife)
                 assert round(server_total('P-GURKE') - before, 3) == 2
-            step('Partnerin öffnet die App erneut (bleibt angemeldet) und bucht per KI-Sprache „zwei Gurken gekauft“', session_and_ai)
+            step('Partnerin öffnet die App neu, nur mit Cookie wie nach „Zum Home-Bildschirm“ (bleibt angemeldet), und bucht per KI-Sprache „zwei Gurken gekauft“', session_and_ai)
 
             def offline():
                 ev0 = ctl('stock')['events']
@@ -238,6 +240,7 @@ def main():
                 owner.click('[data-action="logout"] >> nth=0')
                 owner.wait_for_selector('text=Willkommen bei Tischlein')
                 assert owner.evaluate('localStorage.getItem("tisch-session")') in (None, 'null')
+                assert 'tisch_s=' not in owner.evaluate('document.cookie'), 'Sitzungs-Cookie gelöscht'
             step('Abmelden entfernt Sitzung und zwischengespeicherte Daten', logout)
 
             # ---------------- Demo-Modus (ohne Backend): alle umgebauten Aktionen

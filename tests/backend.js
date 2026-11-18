@@ -201,6 +201,18 @@ test('Journal wird nur angehängt (nie neu geschrieben), Bestandstabelle wird ab
   assert.strictEqual(evRows, fresh().StockEvent.length);
 });
 
+test('Leerzeile im Journal (von Hand eingefügt) → neue Buchung überschreibt nichts', () => {
+  const sh = g.sheet('TEST', 'StockEvent');
+  const n = sh.getLastRow();
+  sh.cells.splice(3, 0, new Array(12).fill(''));          // Leerzeile mitten im Journal
+  const snapshot = JSON.stringify(sh.cells.filter((r) => r.some((v) => v !== '')));
+  ok(ex(M, { type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 1, unit: 'Stk' }));
+  const after = sh.cells.filter((r) => r.some((v) => v !== ''));
+  assert.strictEqual(JSON.stringify(after.slice(0, n)), snapshot, 'alte Zeilen unverändert');
+  assert.strictEqual(after.length, n + 1);
+  assert.ok(EP.verifyLedger({ tables: fresh() }).ok);
+});
+
 test('Gleichzeitiges Speichern: belegte Sperre → klare Meldung, nichts gebucht', () => {
   const before = fresh().StockEvent.length;
   g.setLockBusy(true);
@@ -210,6 +222,7 @@ test('Gleichzeitiges Speichern: belegte Sperre → klare Meldung, nichts gebucht
   ok(ex(F, { type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: -1, unit: 'Stk' }, 'busy-1'));
   assert.strictEqual(fresh().StockEvent.length, before + 1, 'Wiederholung mit gleichem Schlüssel bucht genau einmal');
   refEng.execute({ type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: -1, unit: 'Stk' }, { idempotencyKey: 'busy-1', user: 'ref' });
+  refEng.execute({ type: 'adjust', product_id: 'P-WURST', location_id: 'VK', qty: 1, unit: 'Stk' }, { idempotencyKey: 'leer-1', user: 'ref' });
   same('nach Sperre');
 });
 

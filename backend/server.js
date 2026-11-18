@@ -274,7 +274,7 @@ function tischSave(db) {
       JSON.stringify(now.slice(0, before.length)) === JSON.stringify(before);
     if (prefixSame) {
       var add = now.slice(before.length);
-      var rng = sh.getRange(before.length + 2, 1, add.length, cols.length);
+      var rng = sh.getRange(Math.max(sh.getLastRow(), 1) + 1, 1, add.length, cols.length); // hinter der letzten belegten Zeile, nie überschreiben
       rng.setNumberFormat('@'); rng.setValues(add);
     } else {
       var last = sh.getLastRow();
